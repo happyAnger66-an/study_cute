@@ -1,29 +1,38 @@
 #!/usr/bin/env python3
 """
-高性能 GEMM（CuTeDSL）：D = A @ B，基于 Ampere Tensor Core 的 `TensorOpGemm`。
+高性能 GEMM（CuTeDSL）：D = A @ B，按 GPU 架构选择官方 dense GEMM 实现。
 
 与 `fmha.py` 中 `cutlass.cute` 用法的关系
 ----------------------------------------
 `fmha.py` 里在 MMA warp 上调用 `cute.gemm(tiled_mma, tStC, tSrA, tSrB, tStC)`，配合
 `tcgen05`、`pipeline`、`tiled_mma` 与多级流水线，属于 Blackwell 上高度定制的融合算子。
 
-本脚本走同一 DSL 家族里**更通用、可复用的 dense GEMM 路径**：官方实现的
-`TensorOpGemm`（见 CUTLASS 树内 `cute/ampere/kernel/dense_gemm/tensorop_gemm.py`），内部同样通过
-`tiled_mma` + `cp.async` G2S + 多 stage SMEM 实现高吞吐，但面向经典 C = A×B，无需 SM100。
+本脚本走 DSL 里**可复用的 dense GEMM 封装**，根据 `torch.cuda.get_device_capability()` 分支：
+
+- **SM8.x / 9.x（Ampere、Ada、Hopper 等）**：`TensorOpGemm`
+  （`cute/ampere/kernel/dense_gemm/tensorop_gemm.py`），`tiled_mma` + `cp.async` G2S + 多 stage SMEM。
+- **SM11.x / 12.x+（Jetson Thor `sm_110`、GB10 等 Blackwell GeForce）**：`Sm120GemmKernel`
+  （`cute/blackwell_geforce/kernel/dense_gemm/dense_gemm.py`）。PyTorch 对 Thor 通常报告
+  `get_device_capability() == (11, 0)`（与 CUDA 架构名 sm_110 对应），与桌面 SM12x 一样走该示例核。
+
+数据中心 Blackwell **仅 SM10x**（`DenseGemmKernel` / tcgen05）未在此脚本接入；请直接用 CUTLASS 树内
+`cute/blackwell/kernel/dense_gemm` 示例。
 
 依赖与硬件
 ----------
-- **GPU**：Ampere（SM80）及以上（Tensor Core FP16 路径；Ada/Hopper 通常也可跑该 Ampere 示例）。
+- **GPU**：SM80–9x 走 Ampere 路径；**SM11+**（含 Jetson Thor + CUDA 13）走 Blackwell GeForce `Sm120GemmKernel`
+  路径（需与当前 CUTLASS CuTeDSL 版本匹配）。
 - **Python**：需能 `import cute`（CuTeDSL 示例包）。若未安装到 site-packages，请设置环境变量
   `CUTLASS_CUTEDSL_PATH` 指向 `.../cutlass/examples/python/CuTeDSL`，或把本仓库与 `cutlass` 放在
   同级目录（脚本会尝试 `../../../cutlass/examples/python/CuTeDSL`）。
 
 精度与形状
 ----------
-- 计算为 **FP16 × FP16 → FP32 累加 → FP16 输出**（与官方 `tensorop_gemm` 默认一致）。
-- `TensorOpGemm` 的 CTA tile 为 128×128×32；动态编译要求 K、N 维满足可整除约束（与官方
-  `compile_bmm_dynamic_layout` 一致）。本示例对 M、N、K **向上 pad** 到 128/128/32 的倍数，
-  再截取 `D[:M,:N]` 与 `torch.matmul` 对比。
+- 计算为 **FP16 × FP16 → FP32 累加 → FP16 输出**。
+- **Ampere 路径**：CTA tile 128×128×32；M、N、K 向上 pad 到 128/128/**32** 的倍数。
+- **Blackwell GeForce 路径（SM110 Thor / SM12x 等）**：默认 tile 128×128×**64**；M、N、K 向上 pad 到
+  128/128/**64** 的倍数。
+- 再截取逻辑 `M×N` 与 `torch.matmul`（FP32 累加参考）对比。
 
 运行示例::
 
@@ -41,7 +50,10 @@ from pathlib import Path
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.torch as cutlass_torch
+import cutlass.utils as cutlass_utils
 import torch
+from cutlass.cute.runtime import from_dlpack
 
 
 def _ensure_cutedsl_examples_on_path() -> str:
@@ -73,13 +85,43 @@ def _ensure_cutedsl_examples_on_path() -> str:
 _ensure_cutedsl_examples_on_path()
 from cute.ampere.kernel.dense_gemm.tensorop_gemm import TensorOpGemm  # noqa: E402
 
+try:
+    from cute.blackwell_geforce.kernel.dense_gemm.dense_gemm import (  # noqa: E402
+        Sm120GemmKernel,
+    )
+except ImportError:
+    Sm120GemmKernel = None  # type: ignore[misc, assignment]
+
 
 def _pad(x: int, align: int) -> int:
     return (x + align - 1) // align * align
 
 
+def _tensorop_backend(major: int, minor: int) -> str:
+    """Ampere 示例核 vs Blackwell GeForce 示例核（Jetson Thor SM110=cap 11.0、桌面 SM12x 等）。"""
+    # Thor：`sm_110` → PyTorch 常见为 (11, 0)；与 GB10 等共用 `cute.blackwell_geforce` 的 Sm120GemmKernel。
+    if major >= 11:
+        if Sm120GemmKernel is None:
+            raise RuntimeError(
+                "当前 GPU capability >= 11（含 Jetson Thor SM110），需要 `cute.blackwell_geforce` 中的 "
+                "Sm120GemmKernel，但导入失败。请升级 CUTLASS/CuTeDSL 或检查 CUTLASS_CUTEDSL_PATH。"
+            )
+        return "sm120"
+    if major == 10:
+        raise RuntimeError(
+            f"当前 GPU capability {major}.{minor} 为数据中心 Blackwell SM10x（tcgen05 路径）；"
+            "本脚本未封装 `DenseGemmKernel`。请使用 CUTLASS 树内 `cute/blackwell/kernel/dense_gemm` 示例。"
+        )
+    if major >= 8:
+        return "ampere"
+    raise RuntimeError(
+        f"需要 SM80+ Tensor Core，或 SM11+ Blackwell GeForce（Jetson Thor 等），当前设备 "
+        f"capability {major}.{minor}。"
+    )
+
+
 @cute.jit
-def bmm_tensorop(
+def bmm_tensorop_ampere(
     a: cute.Tensor,
     b: cute.Tensor,
     c: cute.Tensor,
@@ -98,7 +140,23 @@ def bmm_tensorop(
     gemm_op(a, b, c)
 
 
-def _compile_bmm(m: int, n: int, k: int, batch: int = 1):
+@cute.jit
+def bmm_tensorop_sm120(
+    a: cute.Tensor,
+    b: cute.Tensor,
+    c: cute.Tensor,
+    max_active_clusters: cutlass.Constexpr[int],
+    stream,
+):
+    """与 `cute/blackwell_geforce/kernel/dense_gemm/dense_gemm.py` 中 `run()` 一致：M×K×L / N×K×L / M×N×L。"""
+    gemm_op = Sm120GemmKernel(cutlass.Float32, (128, 128, 64))
+    a = cute.make_tensor(a.iterator, cute.select(a.layout, mode=[1, 2, 0]))
+    b = cute.make_tensor(b.iterator, cute.select(b.layout, mode=[2, 1, 0]))
+    c = cute.make_tensor(c.iterator, cute.select(c.layout, mode=[1, 2, 0]))
+    gemm_op(a, b, c, max_active_clusters, stream)
+
+
+def _make_fake_gemm_tensors(batch: int, m: int, n: int, k: int):
     from cutlass.cute.runtime import make_fake_compact_tensor
 
     fake_a = make_fake_compact_tensor(
@@ -110,13 +168,56 @@ def _compile_bmm(m: int, n: int, k: int, batch: int = 1):
     fake_c = make_fake_compact_tensor(
         cutlass.Float16, (batch, m, n), stride_order=(2, 1, 0), assumed_align=16
     )
+    return fake_a, fake_b, fake_c
+
+
+def _compile_bmm_ampere(m: int, n: int, k: int, batch: int = 1):
+    fake_a, fake_b, fake_c = _make_fake_gemm_tensors(batch, m, n, k)
     return cute.compile(
-        bmm_tensorop, fake_a, fake_b, fake_c, options="--enable-tvm-ffi"
+        bmm_tensorop_ampere, fake_a, fake_b, fake_c, options="--enable-tvm-ffi"
     )
 
 
+def _compile_bmm_sm120(m: int, n: int, k: int, batch: int = 1):
+    fake_a, fake_b, fake_c = _make_fake_gemm_tensors(batch, m, n, k)
+    hw = cutlass_utils.HardwareInfo()
+    max_active_clusters = hw.get_max_active_clusters(1)
+    stream = cutlass_torch.default_stream()
+    return cute.compile(
+        bmm_tensorop_sm120,
+        fake_a,
+        fake_b,
+        fake_c,
+        max_active_clusters,
+        stream,
+    )
+
+
+def _torch_to_cute_fp16(t: torch.Tensor) -> cute.Tensor:
+    ct = from_dlpack(t.contiguous(), assumed_align=16)
+    ct = ct.mark_layout_dynamic(leading_dim=cutlass_torch.get_leading_dim(t))
+    ct.element_type = cutlass.Float16
+    return ct
+
+
+def _invoke_gemm(
+    backend: str,
+    compiled,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    c: torch.Tensor,
+) -> None:
+    if backend == "ampere":
+        compiled(a, b, c)
+        return
+    stream = cutlass_torch.default_stream()
+    compiled(_torch_to_cute_fp16(a), _torch_to_cute_fp16(b), _torch_to_cute_fp16(c), stream)
+
+
 def main() -> None:
-    p = argparse.ArgumentParser(description="CuTeDSL TensorOp GEMM (Ampere+)")
+    p = argparse.ArgumentParser(
+        description="CuTeDSL TensorOp GEMM（Ampere / Jetson Thor SM110+ Sm120GemmKernel）"
+    )
     p.add_argument("--m", type=int, default=256)
     p.add_argument("--n", type=int, default=256)
     p.add_argument("--k", type=int, default=128)
@@ -131,13 +232,11 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("需要 CUDA GPU。")
     major, minor = torch.cuda.get_device_capability()
-    if major < 8:
-        raise RuntimeError(
-            f"TensorOpGemm 本示例针对 SM80+ Tensor Core，当前设备 capability {major}.{minor}。"
-        )
+    backend = _tensorop_backend(major, minor)
+    k_align = 64 if backend == "sm120" else 32
 
     m, n, k = args.m, args.n, args.k
-    mp, np, kp = _pad(m, 128), _pad(n, 128), _pad(k, 32)
+    mp, np, kp = _pad(m, 128), _pad(n, 128), _pad(k, k_align)
 
     torch.manual_seed(0)
     a = torch.randn(1, mp, kp, dtype=torch.float16, device="cuda")
@@ -145,29 +244,42 @@ def main() -> None:
     c = torch.zeros(1, mp, np, dtype=torch.float16, device="cuda")
 
     t0 = time.time()
-    compiled = _compile_bmm(mp, np, kp, 1)
+    if backend == "sm120":
+        compiled = _compile_bmm_sm120(mp, np, kp, 1)
+    else:
+        compiled = _compile_bmm_ampere(mp, np, kp, 1)
     t1 = time.time()
 
-    compiled(a, b, c)
+    _invoke_gemm(backend, compiled, a, b, c)
     torch.cuda.synchronize()
     t2 = time.time()
 
     a_sub = a[:, :m, :k]
     b_sub = b[:, :k, :n]
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
     ref = torch.matmul(a_sub.float(), b_sub.float()).half()
     torch.testing.assert_close(c[:, :m, :n], ref, rtol=2e-3, atol=2e-3)
-    print(f"[OK] TensorOpGemm 校验通过 (逻辑形状 M={m} N={n} K={k}, pad 至 {mp}×{np}×{kp})")
+    label = (
+        "Sm120GemmKernel (Blackwell GeForce, SM11 Thor / SM12x+)"
+        if backend == "sm120"
+        else "TensorOpGemm"
+    )
+    print(
+        f"[OK] {label} 校验通过 (逻辑形状 M={m} N={n} K={k}, pad 至 {mp}×{np}×{kp}, "
+        f"capability={major}.{minor})"
+    )
     print(f"[INFO] compile: {(t1 - t0):.3f}s, 首次执行: {(t2 - t1):.3f}s")
 
     if args.bench:
         it = args.bench_iters
         warm = 5
         for _ in range(warm):
-            compiled(a, b, c)
+            _invoke_gemm(backend, compiled, a, b, c)
         torch.cuda.synchronize()
         t0 = time.time()
         for _ in range(it):
-            compiled(a, b, c)
+            _invoke_gemm(backend, compiled, a, b, c)
         torch.cuda.synchronize()
         t_cutlass = (time.time() - t0) / it
 
@@ -182,7 +294,7 @@ def main() -> None:
             torch.matmul(a2, b2, out=c2)
         torch.cuda.synchronize()
         t_torch = (time.time() - t0) / it
-        print(f"[BENCH] TensorOp GEMM (pad): {t_cutlass * 1e6:.2f} us/iter")
+        print(f"[BENCH] CuTeDSL GEMM (pad): {t_cutlass * 1e6:.2f} us/iter")
         print(f"[BENCH] torch.matmul:       {t_torch * 1e6:.2f} us/iter")
 
 

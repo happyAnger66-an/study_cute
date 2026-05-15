@@ -66,7 +66,9 @@ def elementwise_add(
 
     thr_layout = cute.make_ordered_layout((4, 64), order=(1, 0))
     val_layout = cute.make_ordered_layout((16, coalesced_ldst_bytes), order=(1, 0))
+    print(f"[DSL INFO] Val Layout: {val_layout}")
     val_layout = cute.recast_layout(dtype.width, 8, val_layout)
+    print(f"[DSL INFO] Recasted Val Layout: {val_layout}")
     tiler_mn, tv_layout = cute.make_layout_tv(thr_layout, val_layout)
 
     print(f"[DSL INFO] Tiler: {tiler_mn}")

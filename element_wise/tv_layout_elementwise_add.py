@@ -2,6 +2,50 @@ from cutlass import cute
 import torch
 from cutlass.cute.runtime import from_dlpack
 
+@cute.kernel
+def elementwise_add_kernel(
+    gA: cute.Tensor, gB: cute.Tensor, gC: cute.Tensor, tv_layout: cute.Layout
+):
+    tidx, _, _ = cute.arch.thread_idx()
+    bidx, _, _ = cute.arch.block_idx()
+
+    # --------------------------------
+    # slice for thread-block level view
+    # --------------------------------
+    blk_coord = ((None, None), bidx)
+
+    # logical coord -> address
+    blkA = gA[blk_coord]  # (TileM, TileN) -> physical address
+    blkB = gB[blk_coord]  # (TileM, TileN) -> physical address
+    blkC = gC[blk_coord]  # (TileM, TileN) -> physical address
+
+    # --------------------------------
+    # compose for thread-index & value-index to physical mapping
+    # --------------------------------
+    # blockA:    (TileM, TileN) -> physical address
+    # tv_layout: (tid, vid)     -> (TileM, TileN)
+    # tidfrgA = blkA o tv_layout
+    # tidfrgA:   (tid, vid) -> physical address
+    tidfrgA = cute.composition(blkA, tv_layout)
+    tidfrgB = cute.composition(blkB, tv_layout)
+    tidfrgC = cute.composition(blkC, tv_layout)
+
+    print("Composed with TV layout:")
+    print(f"  tidfrgA: {tidfrgA.type}")
+
+    # --------------------------------
+    # slice for thread-level view
+    # --------------------------------
+    # `None` represent slice of the entire per-thread data
+    thr_coord = (tidx, None)
+    # thr_coord = (tidx, cute.repeat_like(None, gA.shape[1]))
+
+    # slice for threads: vid -> address
+    thrA = tidfrgA[thr_coord]  # (V) -> physical address
+    thrB = tidfrgB[thr_coord]  # (V) -> physical address
+    thrC = tidfrgC[thr_coord]  # (V) -> physical address
+
+    thrC[None] = thrA.load() + thrB.load()
 
 @cute.jit
 def elementwise_add(
@@ -45,7 +89,7 @@ def elementwise_add(
         block=[cute.size(tv_layout, mode=[0]), 1, 1],
     )
 
-
+M, N = 16384, 8192
 a = torch.randn(M, N, device="cuda", dtype=torch.float16)
 b = torch.randn(M, N, device="cuda", dtype=torch.float16)
 c = torch.zeros(M, N, device="cuda", dtype=torch.float16)

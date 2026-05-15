@@ -13,6 +13,8 @@
 #   python3 fp16_gemm_no_tma.py --mnk 8192,8192,8192
 #
 # 约束：M、N 可被 (128,256) 整除；K 可被 64 整除（与 mma_tiler 的 K 维一致）。
+# G2S 的 tiled copy 固定为 **ROW_MAJOR（K-major）** 布局，与下方 `run_dense_gemm` 中
+# `mark_layout_dynamic(leading_dim=1)` 一致；若需列主存储，应另写 `const_expr` 分支或单独 JIT。
 
 import argparse
 import os
@@ -242,44 +244,17 @@ def host_function(a: cute.Tensor, b: cute.Tensor, c: cute.Tensor):
     )
     copy_bits = 128
     copy_elems = copy_bits // a.element_type.width
-    bM, bN, bK = mma_tiler_mnk[0], mma_tiler_mnk[1], mma_tiler_mnk[2]
-    a_major = utils.LayoutEnum.from_tensor(a)
-    shape_dim_1_a = bK // copy_elems
-    thread_layout_a = cute.make_layout(
-        (threads_per_cta // shape_dim_1_a, shape_dim_1_a),
-        stride=(shape_dim_1_a, 1),
+    bK = mma_tiler_mnk[2]
+    # 与 run_dense_gemm 中 mark_layout_dynamic(leading_dim=1) 一致：K-major / ROW_MAJOR。
+    # 不在此用运行时 if 切换 thread_layout（DSL 要求分支两侧类型结构一致，需 const_expr）。
+    shape_dim_1 = bK // copy_elems
+    thread_layout_copy = cute.make_layout(
+        (threads_per_cta // shape_dim_1, shape_dim_1),
+        stride=(shape_dim_1, 1),
     )
-    if a_major != utils.LayoutEnum.ROW_MAJOR:
-        shape_dim_0_a = bM // copy_elems
-        thread_layout_a = cute.make_layout(
-            (shape_dim_0_a, threads_per_cta // shape_dim_0_a),
-            stride=(1, shape_dim_0_a),
-        )
-    value_layout_a = (
-        cute.make_layout((1, copy_elems))
-        if a_major == utils.LayoutEnum.ROW_MAJOR
-        else cute.make_layout((copy_elems, 1))
-    )
-    tiled_copy_A = cute.make_tiled_copy_tv(atom_g2s, thread_layout_a, value_layout_a)
-
-    b_major = utils.LayoutEnum.from_tensor(b)
-    shape_dim_1_b = bK // copy_elems
-    thread_layout_b = cute.make_layout(
-        (threads_per_cta // shape_dim_1_b, shape_dim_1_b),
-        stride=(shape_dim_1_b, 1),
-    )
-    if b_major != utils.LayoutEnum.ROW_MAJOR:
-        shape_dim_0_b = bN // copy_elems
-        thread_layout_b = cute.make_layout(
-            (shape_dim_0_b, threads_per_cta // shape_dim_0_b),
-            stride=(1, shape_dim_0_b),
-        )
-    value_layout_b = (
-        cute.make_layout((1, copy_elems))
-        if b_major == utils.LayoutEnum.ROW_MAJOR
-        else cute.make_layout((copy_elems, 1))
-    )
-    tiled_copy_B = cute.make_tiled_copy_tv(atom_g2s, thread_layout_b, value_layout_b)
+    value_layout_copy = cute.make_layout((1, copy_elems))
+    tiled_copy_A = cute.make_tiled_copy_tv(atom_g2s, thread_layout_copy, value_layout_copy)
+    tiled_copy_B = cute.make_tiled_copy_tv(atom_g2s, thread_layout_copy, value_layout_copy)
 
     grid_shape = cute.ceil_div((*c.layout.shape, 1), mma_tiler_mnk[:2])
     kernel(

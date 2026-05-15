@@ -97,6 +97,10 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("需要 CUDA GPU。")
 
+    # 与朴素 FP32 累加核一致：关闭 TF32，否则 a2 @ b2 走 cuBLAS TF32，与全精度 FP32 对比会大量超差。
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+
     m, n, k = args.m, args.n, args.k
     a2 = torch.randn(m, k, device="cuda", dtype=torch.float32)
     b2 = torch.randn(k, n, device="cuda", dtype=torch.float32)

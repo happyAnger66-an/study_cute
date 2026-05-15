@@ -134,12 +134,19 @@ def kernel(
     acc_shape = tiled_mma.partition_shape_C(mma_tiler_mnk[:2])
     tCtAcc = tiled_mma.make_fragment_C(acc_shape)
 
+    # 与 fp16_gemm_0 中 tma_partition 一致：对 SMEM 与 MMA 划分后的 GMEM 视图做 group_modes，
+    # 使 tiled cp.async copy 的索引为 (None, k_tile) / (None, stage)，而非 4 维切片。
+    sA_g = cute.group_modes(sA, 0, 3)
+    sB_g = cute.group_modes(sB, 0, 3)
+    tCgA_g = cute.group_modes(tCgA, 0, 3)
+    tCgB_g = cute.group_modes(tCgB, 0, 3)
+
     thr_copy_A = tiled_copy_A.get_slice(tidx)
     thr_copy_B = tiled_copy_B.get_slice(tidx)
-    tAgA = thr_copy_A.partition_S(gA)
-    tAsA = thr_copy_A.partition_D(sA)
-    tBgB = thr_copy_B.partition_S(gB)
-    tBsB = thr_copy_B.partition_D(sB)
+    tAgA = thr_copy_A.partition_S(tCgA_g)
+    tAsA = thr_copy_A.partition_D(sA_g)
+    tBgB = thr_copy_B.partition_S(tCgB_g)
+    tBsB = thr_copy_B.partition_D(sB_g)
 
     tmem.wait_for_alloc()
     tmem_ptr = tmem.retrieve_ptr(acc_dtype)
@@ -170,13 +177,13 @@ def kernel(
     for k_tile_idx in cutlass.range(num_k_tiles):
         cute.copy(
             tiled_copy_A,
-            tAgA[None, None, None, k_tile_idx],
-            tAsA[None, None, None, 0],
+            tAgA[None, k_tile_idx],
+            tAsA[None, 0],
         )
         cute.copy(
             tiled_copy_B,
-            tBgB[None, None, None, k_tile_idx],
-            tBsB[None, None, None, 0],
+            tBgB[None, k_tile_idx],
+            tBsB[None, 0],
         )
         cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(0)

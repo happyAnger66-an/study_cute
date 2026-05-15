@@ -115,3 +115,5 @@ if __name__ == "__main__":
     # -------------
     # Compare our kernel output with PyTorch's native implementation
     torch.testing.assert_close(c, a + b)  # Raises error if results don't match
+
+    print(f'verify results successfully!')

@@ -1,2 +1,3 @@
-/__pycache__/
+*/__pycache__/
 hello_cutedsl/__pycache__/
+element_wise/__pycache__/ gemm/__pycache__/

@@ -344,36 +344,24 @@ def host_function(a: cute.Tensor, b: cute.Tensor, c: cute.Tensor):
     )
 
 
-def run_dense_gemm(
-    mnk: Tuple[int, int, int],
-    tolerance: float,
-):
+def make_gemm_tensors(m: int, n: int, k: int):
     global torch, cutlass_torch
     import torch
     import cutlass.torch as cutlass_torch
 
-    print("===================================================================")
-    print("Running Blackwell fp16 GEMM example 0 with:")
-    print(f"  mnk:       {mnk}")
-    print(f"  tolerance: {tolerance}")
-    print("===================================================================")
-    print()
+    io_torch_dtype = cutlass_torch.dtype(io_dtype)
 
-    m, n, k = mnk
-    torch.manual_seed(1111)
-
-    # Make K-major tensors (torch tensors are row-major)
-    def make_tensors(mn, k, dtype):
-        shape = (mn, k)
+    def make_random(mn: int, kk: int):
+        shape = (mn, kk)
         return (
             torch.empty(*shape, dtype=torch.int32)
             .random_(-2, 2)
-            .to(dtype=dtype, device="cuda")
+            .to(dtype=io_torch_dtype, device="cuda")
         )
 
-    a = make_tensors(m, k, cutlass_torch.dtype(io_dtype))
-    b = make_tensors(n, k, cutlass_torch.dtype(io_dtype))
-    c = make_tensors(m, n, cutlass_torch.dtype(io_dtype))
+    a = make_random(m, k)
+    b = make_random(n, k)
+    c = make_random(m, n)
     a_tensor = (
         from_dlpack(a, assumed_align=32)
         .mark_layout_dynamic(leading_dim=1)
@@ -389,16 +377,95 @@ def run_dense_gemm(
         .mark_layout_dynamic(leading_dim=1)
         .mark_compact_shape_dynamic(mode=1, divisibility=n)
     )
+    return a, b, c, a_tensor, b_tensor, c_tensor
 
-    # Entry point to the host JIT function
-    host_function(a_tensor, b_tensor, c_tensor, no_cache=True)
 
-    # Compute reference result and verify
-    ref = (torch.einsum("mk,nk->mn", a.to(torch.float32), b.to(torch.float32))).cpu()
+def benchmark_gemm(
+    compiled_gemm,
+    a_tensor,
+    b_tensor,
+    c_tensor,
+    a,
+    b,
+    c,
+    m: int,
+    n: int,
+    k: int,
+    warmup_iterations: int,
+    iterations: int,
+) -> float:
+    args = cute.testing.JitArguments(a_tensor, b_tensor, c_tensor)
+    args.add_to_scope([a, b, c])
+    avg_time_us = cute.testing.benchmark(
+        compiled_gemm,
+        kernel_arguments=args,
+        warmup_iterations=warmup_iterations,
+        iterations=iterations,
+    )
 
+    flops = 2 * m * n * k
+    tflops = flops / (avg_time_us * 1e-6) / 1e12
+    bytes_io = (m * k + n * k + m * n) * 2
+    gbps = bytes_io / (avg_time_us * 1e-3)
+
+    print("Performance Metrics:")
+    print("-------------------")
+    print(f"  Kernel time:     {avg_time_us:.4f} us")
+    print(f"  Throughput:      {tflops:.3f} TFLOPS")
+    print(f"  Effective BW:    {gbps:.2f} GB/s")
+    print()
+    return avg_time_us
+
+
+def run_dense_gemm(
+    mnk: Tuple[int, int, int],
+    tolerance: float,
+    *,
+    do_benchmark: bool = False,
+    warmup_iterations: int = 10,
+    iterations: int = 100,
+):
+    global torch, cutlass_torch
+    import torch
+    import cutlass.torch as cutlass_torch
+
+    print("===================================================================")
+    print("Running Blackwell fp16 GEMM example 0 with:")
+    print(f"  mnk:       {mnk}")
+    print(f"  tolerance: {tolerance}")
+    if do_benchmark:
+        print(f"  benchmark: warmup={warmup_iterations}, iterations={iterations}")
+    print("===================================================================")
+    print()
+
+    m, n, k = mnk
+    torch.manual_seed(1111)
+
+    a, b, c, a_tensor, b_tensor, c_tensor = make_gemm_tensors(m, n, k)
+
+    compiled_gemm = cute.compile(host_function, a_tensor, b_tensor, c_tensor)
+    compiled_gemm(a_tensor, b_tensor, c_tensor)
+
+    ref = torch.einsum("mk,nk->mn", a.to(torch.float32), b.to(torch.float32)).cpu()
     torch.testing.assert_close(
         c.cpu(), ref.to(cutlass_torch.dtype(io_dtype)), atol=tolerance, rtol=1e-05
     )
+
+    if do_benchmark:
+        benchmark_gemm(
+            compiled_gemm,
+            a_tensor,
+            b_tensor,
+            c_tensor,
+            a,
+            b,
+            c,
+            m,
+            n,
+            k,
+            warmup_iterations,
+            iterations,
+        )
 
 
 if __name__ == "__main__":
@@ -428,6 +495,23 @@ if __name__ == "__main__":
     parser.add_argument(
         "--tolerance", type=float, default=1e-01, help="Tolerance for validation"
     )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Run performance benchmark after validation",
+    )
+    parser.add_argument(
+        "--warmup_iterations",
+        type=int,
+        default=10,
+        help="Warmup iterations for benchmark",
+    )
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=100,
+        help="Timed iterations for benchmark",
+    )
     args = parser.parse_args()
     if len(args.mnk) != 3:
         parser.error("--mnk must contain exactly 3 values")
@@ -437,5 +521,8 @@ if __name__ == "__main__":
     run_dense_gemm(
         args.mnk,
         args.tolerance,
+        do_benchmark=args.benchmark,
+        warmup_iterations=args.warmup_iterations,
+        iterations=args.iterations,
     )
     print("PASS")

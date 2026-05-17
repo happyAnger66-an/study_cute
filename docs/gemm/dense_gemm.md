@@ -227,6 +227,8 @@ epilogue_op = lambda x: cute.where(x > 0, x, cute.full_like(x, 0))
 
 ### 7.1 示例命令
 
+正确性（默认不跑 benchmark）：
+
 ```bash
 python gemm/dense_gemm.py \
   --ab_dtype Float16 --c_dtype Float16 --acc_dtype Float32 \
@@ -235,13 +237,38 @@ python gemm/dense_gemm.py \
   --use_tma_store --use_2cta_instrs
 ```
 
-### 7.2 `run()` 流程
+性能 benchmark（校验通过后打印 TFLOPS / GB/s，默认 warmup=10、iterations=100）：
+
+```bash
+python gemm/dense_gemm.py \
+  --ab_dtype Float16 --c_dtype Float16 --acc_dtype Float32 \
+  --mma_tiler_mn 256,128 --cluster_shape_mn 2,1 \
+  --mnkl 8192,8192,8192,1 \
+  --use_tma_store --use_2cta_instrs \
+  --benchmark
+```
+
+可选：`--warmup_iterations`、`--iterations`、`--use_cold_l2`、`--skip_ref_check`。
+
+### 7.2 Benchmark 输出
+
+`benchmark_dense_gemm()` 在 `--benchmark` 时调用，指标包括：
+
+| 字段 | 含义 |
+|------|------|
+| Problem (M,N,K,L) | 问题规模（含 batch L） |
+| Kernel time | 平均 kernel 时间（μs） |
+| Throughput | `2×M×N×K×L / time` → TFLOPS |
+| Effective BW | 读 A+B + 写 C 的字节量 / time → GB/s |
+| FLOPs / Memory traffic | 绝对量 |
+
+### 7.3 `run()` 流程
 
 1. `create_tensors` 构造 CuTe / PyTorch 张量。
 2. `DenseGemmKernel(...)` + `can_implement` 校验。
 3. **`cute.compile(gemm, ...)`** 编译。
 4. 可选 `compare` 与 PyTorch 参考。
-5. **`cutlass.cute.testing.benchmark`**（`warmup_iterations`、`iterations`、`use_cold_l2`）。
+5. 若 `do_benchmark`：`benchmark_dense_gemm`（`cutlass.cute.testing.benchmark`）。
 
 ---
 

@@ -1587,6 +1587,89 @@ def compare(a_torch_cpu, b_torch_cpu, c_torch_gpu, c_dtype, tolerance):
     torch.testing.assert_close(kernel_result, ref_result, atol=tolerance, rtol=1e-05)
 
 
+def _element_size_bytes(dtype: Type[cutlass.Numeric]) -> int:
+    width = dtype.width if dtype is not cutlass.Boolean else 8
+    return max(1, width // 8)
+
+
+def benchmark_dense_gemm(
+    compiled_gemm,
+    a_torch_cpu,
+    b_torch_cpu,
+    c_torch_cpu,
+    ab_dtype: Type[cutlass.Numeric],
+    c_dtype: Type[cutlass.Numeric],
+    mnkl: Tuple[int, int, int, int],
+    stream: cuda.CUstream,
+    *,
+    warmup_iterations: int = 10,
+    iterations: int = 100,
+    use_cold_l2: bool = False,
+) -> dict:
+    """Benchmark compiled dense GEMM and print TFLOPS / effective bandwidth."""
+    m, n, k, l = mnkl
+    ab_bytes = _element_size_bytes(ab_dtype)
+    c_bytes = _element_size_bytes(c_dtype)
+
+    def generate_tensors():
+        import cutlass.torch as cutlass_torch
+
+        a_tensor, _ = cutlass_torch.cute_tensor_like(
+            a_torch_cpu, ab_dtype, is_dynamic_layout=True, assumed_align=16
+        )
+        b_tensor, _ = cutlass_torch.cute_tensor_like(
+            b_torch_cpu, ab_dtype, is_dynamic_layout=True, assumed_align=16
+        )
+        c_tensor, _ = cutlass_torch.cute_tensor_like(
+            c_torch_cpu, c_dtype, is_dynamic_layout=True, assumed_align=16
+        )
+        return testing.JitArguments(a_tensor, b_tensor, c_tensor, stream)
+
+    workspace_count = 1
+    if use_cold_l2:
+        one_workspace_bytes = (
+            a_torch_cpu.numel() * a_torch_cpu.element_size()
+            + b_torch_cpu.numel() * b_torch_cpu.element_size()
+            + c_torch_cpu.numel() * c_torch_cpu.element_size()
+        )
+        workspace_count = testing.get_workspace_count(
+            one_workspace_bytes, warmup_iterations, iterations
+        )
+
+    avg_time_us = testing.benchmark(
+        compiled_gemm,
+        workspace_generator=generate_tensors,
+        workspace_count=workspace_count,
+        stream=stream,
+        warmup_iterations=warmup_iterations,
+        iterations=iterations,
+    )
+
+    flops = 2 * m * n * k * l
+    tflops = flops / (avg_time_us * 1e-6) / 1e12
+    bytes_io = (m * k + n * k) * l * ab_bytes + m * n * l * c_bytes
+    gbps = bytes_io / (avg_time_us * 1e-3)
+
+    print()
+    print("Performance Metrics:")
+    print("-------------------")
+    print(f"  Problem (M,N,K,L): ({m}, {n}, {k}, {l})")
+    print(f"  Kernel time:       {avg_time_us:.4f} us")
+    print(f"  Throughput:        {tflops:.3f} TFLOPS")
+    print(f"  Effective BW:      {gbps:.2f} GB/s  (read A+B + write C)")
+    print(f"  FLOPs:             {flops:,}")
+    print(f"  Memory traffic:    {bytes_io / 1e9:.3f} GB")
+    print()
+
+    return {
+        "avg_time_us": avg_time_us,
+        "tflops": tflops,
+        "gbps": gbps,
+        "flops": flops,
+        "bytes_io": bytes_io,
+    }
+
+
 def run(
     mnkl: Tuple[int, int, int, int],
     ab_dtype: Type[cutlass.Numeric],
@@ -1604,12 +1687,13 @@ def run(
     iterations: int = 1,
     skip_ref_check: bool = False,
     use_cold_l2: bool = False,
+    do_benchmark: bool = False,
     **kwargs,
 ):
-    """Execute a batched dense GEMM operation on Blackwell architecture with performance benchmarking.
+    """Execute a batched dense GEMM operation on Blackwell architecture.
 
     This function prepares input tensors, configures and launches the GEMM kernel,
-    optionally performs reference validation, and benchmarks the execution performance.
+    optionally performs reference validation, and optionally benchmarks performance.
 
     :param mnkl: Problem size (M, N, K, L)
     :type mnkl: Tuple[int, int, int, int]
@@ -1643,10 +1727,12 @@ def run(
     :type skip_ref_check: bool, optional
     :param use_cold_l2: Whether to use circular buffer strategy to ensure cold L2 cache, defaults to False
     :type use_cold_l2: bool, optional
+    :param do_benchmark: If True, run timed benchmark and print TFLOPS / GB/s
+    :type do_benchmark: bool, optional
     :raises RuntimeError: If CUDA GPU is not available
     :raises ValueError: If the configuration is invalid or unsupported by the kernel
-    :return: Execution time of the GEMM kernel
-    :rtype: float
+    :return: Benchmark metrics dict if ``do_benchmark`` else None
+    :rtype: Optional[dict]
     """
     print("Running Blackwell Dense GEMM test with:")
     print(f"mnkl: {mnkl}")
@@ -1660,6 +1746,8 @@ def run(
     print(f"Iterations: {iterations}")
     print(f"Skip reference checking: {skip_ref_check}")
     print(f"Use cold L2: {'True' if use_cold_l2 else 'False'}")
+    if do_benchmark:
+        print(f"Benchmark: warmup={warmup_iterations}, iterations={iterations}")
     import torch
 
     # Unpack parameters
@@ -1699,50 +1787,28 @@ def run(
             f"mma_tiler_mn = {mma_tiler_mn}, cluster_shape_mn = {cluster_shape_mn}, "
             f"use_tma_store = {use_tma_store}"
         )
-    max_active_clusters = utils.HardwareInfo().get_max_active_clusters(
-        cluster_shape_mn[0] * cluster_shape_mn[1]
-    )
     compiled_gemm = cute.compile(gemm, a_tensor, b_tensor, c_tensor, current_stream)
 
     if not skip_ref_check:
         compiled_gemm(a_tensor, b_tensor, c_tensor, current_stream)
         compare(a_torch_cpu, b_torch_cpu, c_torch_gpu, c_dtype, tolerance)
 
-    def generate_tensors():
-        import cutlass.torch as cutlass_torch
+    if not do_benchmark:
+        return None
 
-        a_tensor, _ = cutlass_torch.cute_tensor_like(
-            a_torch_cpu, ab_dtype, is_dynamic_layout=True, assumed_align=16
-        )
-        b_tensor, _ = cutlass_torch.cute_tensor_like(
-            b_torch_cpu, ab_dtype, is_dynamic_layout=True, assumed_align=16
-        )
-        c_tensor, _ = cutlass_torch.cute_tensor_like(
-            c_torch_cpu, c_dtype, is_dynamic_layout=True, assumed_align=16
-        )
-        return testing.JitArguments(a_tensor, b_tensor, c_tensor, current_stream)
-
-    workspace_count = 1
-    if use_cold_l2:
-        one_workspace_bytes = (
-            a_torch_cpu.numel() * a_torch_cpu.element_size()
-            + b_torch_cpu.numel() * b_torch_cpu.element_size()
-            + c_torch_cpu.numel() * c_torch_cpu.element_size()
-        )
-        workspace_count = testing.get_workspace_count(
-            one_workspace_bytes, warmup_iterations, iterations
-        )
-
-    exec_time = testing.benchmark(
+    return benchmark_dense_gemm(
         compiled_gemm,
-        workspace_generator=generate_tensors,
-        workspace_count=workspace_count,
-        stream=current_stream,
+        a_torch_cpu,
+        b_torch_cpu,
+        c_torch_cpu,
+        ab_dtype,
+        c_dtype,
+        mnkl,
+        current_stream,
         warmup_iterations=warmup_iterations,
         iterations=iterations,
+        use_cold_l2=use_cold_l2,
     )
-
-    return exec_time  # Return execution time in microseconds
 
 
 if __name__ == "__main__":
@@ -1793,13 +1859,21 @@ if __name__ == "__main__":
         "--tolerance", type=float, default=1e-01, help="Tolerance for validation"
     )
     parser.add_argument(
-        "--warmup_iterations", type=int, default=0, help="Warmup iterations"
+        "--benchmark",
+        action="store_true",
+        help="Run performance benchmark after validation (default warmup=10, iterations=100)",
+    )
+    parser.add_argument(
+        "--warmup_iterations",
+        type=int,
+        default=None,
+        help="Warmup iterations for benchmark (default: 10 with --benchmark, else 0)",
     )
     parser.add_argument(
         "--iterations",
         type=int,
-        default=1,
-        help="Number of iterations to run the kernel",
+        default=None,
+        help="Timed iterations for benchmark (default: 100 with --benchmark, else unused)",
     )
     parser.add_argument(
         "--skip_ref_check", action="store_true", help="Skip reference checking"
@@ -1822,6 +1896,17 @@ if __name__ == "__main__":
     if len(args.cluster_shape_mn) != 2:
         parser.error("--cluster_shape_mn must contain exactly 2 values")
 
+    warmup_iterations = (
+        args.warmup_iterations
+        if args.warmup_iterations is not None
+        else (10 if args.benchmark else 0)
+    )
+    iterations = (
+        args.iterations
+        if args.iterations is not None
+        else (100 if args.benchmark else 1)
+    )
+
     run(
         args.mnkl,
         args.ab_dtype,
@@ -1835,9 +1920,10 @@ if __name__ == "__main__":
         args.use_2cta_instrs,
         args.use_tma_store,
         args.tolerance,
-        args.warmup_iterations,
-        args.iterations,
+        warmup_iterations,
+        iterations,
         args.skip_ref_check,
         args.use_cold_l2,
+        do_benchmark=args.benchmark,
     )
     print("PASS")

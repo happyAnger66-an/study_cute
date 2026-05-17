@@ -41,6 +41,43 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 
 import cutlass.cute.testing as testing
 
+# 与 CUTLASS cutlass.cutlass_dsl.cutlass.SMEM_CAPACITY_MAP 对齐；旧版 pip 包可能缺少 sm_110 等项。
+_SMEM_CAPACITY_FALLBACK: dict[str, int] = {
+    "sm_121": (100 - 1) * 1024,
+    "sm_120": (100 - 1) * 1024,
+    "sm_110": (228 - 1) * 1024,
+    "sm_103": (228 - 1) * 1024,
+    "sm_101": (228 - 1) * 1024,
+    "sm_100": (228 - 1) * 1024,
+    "sm_90": (228 - 1) * 1024,
+    "sm_89": (100 - 1) * 1024,
+    "sm_86": (100 - 1) * 1024,
+    "sm_87": (164 - 1) * 1024,
+    "sm_80": (164 - 1) * 1024,
+}
+
+
+def _get_smem_capacity_in_bytes() -> int:
+    """Host-side SMEM capacity; fallback when DSL SMEM_CAPACITY_MAP lacks current arch."""
+    try:
+        return utils.get_smem_capacity_in_bytes()
+    except ValueError as exc:
+        if "Unsupported compute capability" not in str(exc):
+            raise
+        import torch
+
+        if not torch.cuda.is_available():
+            raise
+        major, minor = torch.cuda.get_device_capability()
+        cc = f"sm_{major}{minor}"
+        if cc in _SMEM_CAPACITY_FALLBACK:
+            return _SMEM_CAPACITY_FALLBACK[cc]
+        raise ValueError(
+            f"Unsupported compute capability {cc!r} for shared memory capacity lookup. "
+            f"Upgrade nvidia-cutlass-dsl or extend _SMEM_CAPACITY_FALLBACK in dense_gemm.py."
+        ) from exc
+
+
 """
 A high-performance batched dense GEMM (C = A * B) example for the NVIDIA Blackwell SM100 architecture
 using CUTE DSL.
@@ -275,7 +312,7 @@ class DenseGemmKernel:
         else:
             self.epi_tile = self.cta_tile_shape_mnk[:2]
 
-        self.smem_capacity = utils.get_smem_capacity_in_bytes()
+        self.smem_capacity = _get_smem_capacity_in_bytes()
 
         # Setup A/B/C stage count in shared memory
         self.num_acc_stage, self.num_ab_stage, self.num_c_stage = self._compute_stages(
@@ -564,10 +601,10 @@ class DenseGemmKernel:
         )
         # Tensor memory dealloc barrier init
         tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf.ptr,
+            storage.tmem_holding_buf,
             barrier_for_retrieve=tmem_alloc_barrier,
             is_two_cta=use_2cta_instrs,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar,
         )
 
         # Cluster arrive after barrier init
@@ -1630,6 +1667,15 @@ def run(
 
     if not torch.cuda.is_available():
         raise RuntimeError("GPU is required to run this example!")
+
+    major, minor = torch.cuda.get_device_capability()
+    if major >= 11:
+        print(
+            "Note: GPU reports Blackwell GeForce (e.g. Jetson Thor sm_110, capability "
+            f"{major}.{minor}). This script targets datacenter SM100 tcgen05/TMEM GEMM. "
+            "If compile or run fails, use CUTLASS blackwell_geforce dense_gemm "
+            "(Sm120GemmKernel) or hello_cutedsl/hello_cutedsl_matmul_tensorop.py."
+        )
 
     # Get current CUDA stream from PyTorch
     torch_stream = torch.cuda.current_stream()

@@ -17,4 +17,5 @@ try:
 
     visualize()
 except ImportError:
+    print("cute_viz is not installed")
     pass

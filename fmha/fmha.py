@@ -242,24 +242,28 @@ class BlackwellFusedMultiHeadAttentionForward:
     def _pick_pipeline_stages(self, d_eff: int) -> None:
         """Choose q/kv/epi stages from padded head dim (mma K) to stay under SMEM budget.
 
+        q_stage must stay 2: each CTA issues two Q tiles (Q0/Q1) through the Q
+        pipeline (load + MMA each call acquire_and_advance once). q_stage=1 reuses
+        the same SMEM slot and deadlocks.
+
         See study_cute/docs/support_d256.md (P0).
         """
         is_fp8 = self.q_dtype.width == 8
+        self.q_stage = 2
         if d_eff <= 128:
-            self.q_stage = 2
             self.kv_stage = 4 if is_fp8 else 3
             self.epi_stage = 2
-        elif d_eff <= 160:
-            self.q_stage = 1
-            self.kv_stage = 3 if is_fp8 else 2
+        elif d_eff <= 146:
+            self.kv_stage = 4 if is_fp8 else 3
             self.epi_stage = 1
         elif d_eff <= 176:
-            self.q_stage = 1
-            self.kv_stage = 2
+            self.kv_stage = 3 if is_fp8 else 2
+            self.epi_stage = 1
+        elif d_eff <= 192:
+            self.kv_stage = 3 if is_fp8 else 2
             self.epi_stage = 1
         else:
-            self.q_stage = 1
-            self.kv_stage = 2 if is_fp8 else 1
+            self.kv_stage = 2 if is_fp8 else 2
             self.epi_stage = 1
 
     @staticmethod
@@ -269,13 +273,13 @@ class BlackwellFusedMultiHeadAttentionForward:
         q_stage: int,
         kv_stage: int,
         epi_stage: int,
-        cta_m: int,
+        m_tile: int,
         n_tile: int,
         epi_m: int,
     ) -> int:
-        """Conservative staged Q+K(V)+O SMEM (barriers/swizzle extra not included)."""
+        """Conservative staged Q+K(V)+O SMEM per MMA tile (not full cta_tiler M)."""
         return elem_bytes * (
-            q_stage * cta_m * d_eff
+            q_stage * m_tile * d_eff
             + kv_stage * n_tile * d_eff
             + epi_stage * epi_m * d_eff
         )
@@ -286,18 +290,17 @@ class BlackwellFusedMultiHeadAttentionForward:
         d_eff = self.qk_mma_tiler[2]
         self._pick_pipeline_stages(d_eff)
         elem_bytes = max(1, q_dtype.width // 8)
-        cta_m = 2 * self.qk_mma_tiler[0]
+        m_tile = self.qk_mma_tiler[0]
         n_tile = self.qk_mma_tiler[1]
-        epi_m = self.qk_mma_tiler[0]
         est = self._estimate_staged_smem_bytes(
             d_eff,
             elem_bytes,
             self.q_stage,
             self.kv_stage,
             self.epi_stage,
-            cta_m,
+            m_tile,
             n_tile,
-            epi_m,
+            m_tile,
         )
         if d_eff > 128:
             print(

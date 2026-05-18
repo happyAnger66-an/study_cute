@@ -20,28 +20,30 @@
 
 ### 思路
 
-固定 `q_stage=2, kv_stage=3, epi_stage=2` 时，动态 SMEM 粗算：
+固定 `q_stage=2, kv_stage=3, epi_stage=2` 时，动态 SMEM 粗算（按 **MMA tile** 128×128，非 cta M=256）：
 
 ```text
-bytes ≈ elem_size × (q_stage×cta_M×D + kv_stage×N_tile×D + epi_stage×128×D)
-cta_M = 2×128 = 256, N_tile = 128
-FP16: ≈ 2304 × D 字节（q=2,kv=3,epi=2）
-FP16 减 stage (q=1,kv=2,epi=1): ≈ 1280 × D 字节
+bytes ≈ elem_size × (q_stage×128×D + kv_stage×128×D + epi_stage×128×D)
+FP16 默认 (q=2,kv=3,epi=2): ≈ 1792 × D 字节
+FP16 P0   (q=2,kv=3,epi=1): ≈ 1536 × D 字节
 ```
 
 Blackwell 每 CTA 动态 SMEM 预算约 **220 KiB**（留 barrier/对齐余量）。
 
-| D | 默认 stage 估算 | q=1,kv=2,epi=1 |
-|---|----------------|----------------|
-| 128 | ~224 KB | ~160 KB |
-| 144 | ~252 KB ❌ | ~180 KB ✅ |
-| 180 | ~315 KB ❌ | ~225 KB 临界 |
-| 192 | ~336 KB ❌ | ~240 KB ❌ → 需 P1 |
+**硬约束：`q_stage` 必须为 2**  
+每 CTA 对 Q0、Q1 各 `acquire_and_advance()` 一次；`q_stage=1` 会复用同一 SMEM 槽 → **pipeline 死锁（表现为 compile 后 kernel 卡住）**。
+
+| D | 默认 (2,3,2) | P0 (2,3,1) |
+|---|--------------|------------|
+| 128 | ~224 KB | ~196 KB |
+| 144 | ~258 KB ❌ | ~221 KB ✅ |
+| 176 | ~315 KB ❌ | ~264 KB ❌ |
+| 192+ | — | 需减 kv 或 **P1 分块** |
 
 ### 代码改动（`BlackwellFusedMultiHeadAttentionForward`）
 
 1. **`_pick_pipeline_stages(d_eff)`**  
-   按 `qk_mma_tiler[2]`（padded D）选择 `q_stage / kv_stage / epi_stage`。
+   **`q_stage` 恒为 2**；`D>128` 时优先只减 **`epi_stage`（2→1）**，必要时再减 `kv_stage`（不低于 2，避免 KV 流水死锁）。
 
 2. **`_setup_attributes()`**  
    调用 `_pick_pipeline_stages`，再设置 softmax prescale 等（行为不变）。

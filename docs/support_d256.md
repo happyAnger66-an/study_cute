@@ -10,8 +10,8 @@
 
 | 阶段 | 目标 D | 状态 |
 |------|--------|------|
-| **P0** | 仅 **SMEM 校验** + `D>128` 提前报错 | ✅ 已实施（**不能**单独支持 D=144） |
-| **P1** | 129–256+（D 分块） | 待做 |
+| **P0** | SMEM 估算 + 禁止减 `q_stage` | ✅ 已实施（**不能**单独支持 D=144） |
+| **P1** | 129–256+（`D_chunk=128`） | ✅ 已实施（待 Blackwell GPU 数值验证） |
 | **P2** | TRT AOT + runner | 待做 |
 
 ---
@@ -30,23 +30,30 @@
 
 ### 代码（`validate_config_host`）
 
-- `D_mma > 128` → 明确 `ValueError`（避免 launch 后 ILLEGAL_ADDRESS）
-- `D_mma ≤ 128` 且 staged SMEM 估算超预算 → `ValueError`
+- staged SMEM 按 `D_chunk=128` 估算（与 D=128 相同），预算 `227KB`
+- `num_d_chunks > 1` 时打印 D-chunk 信息
 - Pipeline stage **保持默认** `q=2, kv=3, epi=2`（不再对 D>128 减 stage）
 
 ### 验证
 
 ```bash
-# 应通过
+# 回归
 python3 fmha/fmha.py --q_shape 1,968,8,128 --k_shape 1,968,1,128
 
-# 应 compile 前报错（需 P1）
+# P1：D=144 / D=256（需 SM100+ 与 CUTE_DSL_ARCH）
 python3 fmha/fmha.py --q_shape 1,968,8,144 --k_shape 1,968,1,144
+python3 fmha/fmha.py --q_shape 1,968,8,256 --k_shape 1,968,1,256
 ```
 
 ---
 
-## 阶段 P1：D 方向分块（`D_chunk=128`）
+## 阶段 P1：D 方向分块（`D_chunk=128`）— 已实施
+
+实现文件：`study_cute/fmha/fmha.py`。
+
+- Host：`D_CHUNK=128`，`mma_tiler` 第三维恒为 128，`actual_head_dim` 为真实 D，`num_d_chunks=ceil(D/128)`。
+- Load/MMA/Correction/Epilogue：对 `d_chunk_idx` 循环；QK 跨 chunk 累加 S；PV 跨 chunk 累加 O（`ACCUMULATE` 含 `d_chunk_idx != 0`）；Epilogue 写 `gO[..., d_chunk_idx, ...]`。
+- `inv_sqrt_head_dim` 仍用完整 `head_dim`。
 
 ### 核心
 

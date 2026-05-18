@@ -10,62 +10,38 @@
 
 | 阶段 | 目标 D | 状态 |
 |------|--------|------|
-| **P0** | ~129–180（含 **144**） | ✅ 已在 `study_cute/fmha/fmha.py` 实施 |
-| **P1** | 192 / 256 / 更大 | 待做（D 分块） |
-| **P2** | TRT AOT + runner | 待做（不改 Edge-LLM 直至 P1 稳定） |
+| **P0** | 仅 **SMEM 校验** + `D>128` 提前报错 | ✅ 已实施（**不能**单独支持 D=144） |
+| **P1** | 129–256+（D 分块） | 待做 |
+| **P2** | TRT AOT + runner | 待做 |
 
 ---
 
-## 阶段 P0：按 D 自适应 pipeline stage（已实施）
+## 阶段 P0：Host 校验（已实施，**不**支持 D>128 跑通）
 
-### 思路
+### 实验结论（D=144）
 
-固定 `q_stage=2, kv_stage=3, epi_stage=2` 时，动态 SMEM 粗算（按 **MMA tile** 128×128，非 cta M=256）：
+| 现象 | 原因 |
+|------|------|
+| `q=1` 时 compile 后**卡死** | `q_stage=1` 与双 Q tile 流水线死锁 |
+| `q=2,kv=3,epi=1` 后 **ILLEGAL_ADDRESS** | **TMEM**：`tmem_o0=256`、`tmem_o1=384` 间距仅 **128 列**，PV 的 O 宽 = **D=144** → O0 占 256..399，与 O1@384 **重叠**；且 256+2×144>512 |
+| 减 `epi_stage` **不能**修 TMEM | 根因是 **D 维列数**，不是 epilogue stage |
 
-```text
-bytes ≈ elem_size × (q_stage×128×D + kv_stage×128×D + epi_stage×128×D)
-FP16 默认 (q=2,kv=3,epi=2): ≈ 1792 × D 字节
-FP16 P0   (q=2,kv=3,epi=1): ≈ 1536 × D 字节
-```
+**结论：P0 不能替代 P1。`D>128` 必须在 compile 前拒绝，或实现 D 分块。**
 
-Blackwell 每 CTA 动态 SMEM 预算约 **220 KiB**（留 barrier/对齐余量）。
+### 代码（`validate_config_host`）
 
-**硬约束：`q_stage` 必须为 2**  
-每 CTA 对 Q0、Q1 各 `acquire_and_advance()` 一次；`q_stage=1` 会复用同一 SMEM 槽 → **pipeline 死锁（表现为 compile 后 kernel 卡住）**。
+- `D_mma > 128` → 明确 `ValueError`（避免 launch 后 ILLEGAL_ADDRESS）
+- `D_mma ≤ 128` 且 staged SMEM 估算超预算 → `ValueError`
+- Pipeline stage **保持默认** `q=2, kv=3, epi=2`（不再对 D>128 减 stage）
 
-| D | 默认 (2,3,2) | P0 (2,3,1) |
-|---|--------------|------------|
-| 128 | ~224 KB | ~196 KB |
-| 144 | ~258 KB ❌ | ~221 KB ✅ |
-| 176 | ~315 KB ❌ | ~264 KB ❌ |
-| 192+ | — | 需减 kv 或 **P1 分块** |
-
-### 代码改动（`BlackwellFusedMultiHeadAttentionForward`）
-
-1. **`_pick_pipeline_stages(d_eff)`**  
-   **`q_stage` 恒为 2**；`D>128` 时优先只减 **`epi_stage`（2→1）**，必要时再减 `kv_stage`（不低于 2，避免 KV 流水死锁）。
-
-2. **`_setup_attributes()`**  
-   调用 `_pick_pipeline_stages`，再设置 softmax prescale 等（行为不变）。
-
-3. **`validate_config_host(q_dtype)`**  
-   Host 在 `cute.compile` 前调用：估算 staged SMEM，超限则 `ValueError` 并指向本文 P1。
-
-4. **`run()` / `run_llm_multi_round_prefill_test()`**  
-   创建 `fmha` 后、`cute.compile` 前调用 `validate_config_host(in_dtype)`。
-
-### 验证命令
+### 验证
 
 ```bash
-cd study_cute
-# 应通过（P0 减 stage）
-python3 fmha/fmha.py --q_shape 1,968,8,144 --k_shape 1,968,1,144
-
-# 回归
+# 应通过
 python3 fmha/fmha.py --q_shape 1,968,8,128 --k_shape 1,968,1,128
 
-# 应 Host 明确报错（需 P1），而非 INVALID_VALUE
-python3 fmha/fmha.py --q_shape 1,968,8,192 --k_shape 1,968,1,192
+# 应 compile 前报错（需 P1）
+python3 fmha/fmha.py --q_shape 1,968,8,144 --k_shape 1,968,1,144
 ```
 
 ---

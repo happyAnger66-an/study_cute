@@ -240,31 +240,15 @@ class BlackwellFusedMultiHeadAttentionForward:
         )
 
     def _pick_pipeline_stages(self, d_eff: int) -> None:
-        """Choose q/kv/epi stages from padded head dim (mma K) to stay under SMEM budget.
+        """Pipeline stages for Q/KV/O SMEM buffering.
 
-        q_stage must stay 2: each CTA issues two Q tiles (Q0/Q1) through the Q
-        pipeline (load + MMA each call acquire_and_advance once). q_stage=1 reuses
-        the same SMEM slot and deadlocks.
-
-        See study_cute/docs/support_d256.md (P0).
+        q_stage must stay 2 (dual Q tiles per CTA). D>128 needs P1 D-chunking, not
+        stage tweaks — see validate_config_host and docs/support_d256.md.
         """
         is_fp8 = self.q_dtype.width == 8
         self.q_stage = 2
-        if d_eff <= 128:
-            self.kv_stage = 4 if is_fp8 else 3
-            self.epi_stage = 2
-        elif d_eff <= 146:
-            self.kv_stage = 4 if is_fp8 else 3
-            self.epi_stage = 1
-        elif d_eff <= 176:
-            self.kv_stage = 3 if is_fp8 else 2
-            self.epi_stage = 1
-        elif d_eff <= 192:
-            self.kv_stage = 3 if is_fp8 else 2
-            self.epi_stage = 1
-        else:
-            self.kv_stage = 2 if is_fp8 else 2
-            self.epi_stage = 1
+        self.kv_stage = 4 if is_fp8 else 3
+        self.epi_stage = 2
 
     @staticmethod
     def _estimate_staged_smem_bytes(
@@ -289,6 +273,15 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.q_dtype = q_dtype
         d_eff = self.qk_mma_tiler[2]
         self._pick_pipeline_stages(d_eff)
+        if d_eff > 128:
+            raise ValueError(
+                f"FMHA CuTe kernel supports head_dim/D_mma <= 128 only (got {d_eff}, "
+                f"head_dim={self.head_dim}). "
+                f"D>128 overflows TMEM column map (O0/O1 need 2×D cols, max 512) and "
+                f"causes CUDA_ERROR_ILLEGAL_ADDRESS even if SMEM fits. "
+                f"Use D<=128, FMHA_v2, or implement P1 D-chunking — see "
+                f"study_cute/docs/support_d256.md"
+            )
         elem_bytes = max(1, q_dtype.width // 8)
         m_tile = self.qk_mma_tiler[0]
         n_tile = self.qk_mma_tiler[1]
@@ -302,18 +295,10 @@ class BlackwellFusedMultiHeadAttentionForward:
             n_tile,
             m_tile,
         )
-        if d_eff > 128:
-            print(
-                f"[fmha] D_mma={d_eff} (head_dim={self.head_dim}): "
-                f"stages q={self.q_stage} kv={self.kv_stage} epi={self.epi_stage}, "
-                f"estimated staged SMEM={est} bytes (budget {self.SMEM_BUDGET_BYTES})"
-            )
         if est > self.SMEM_BUDGET_BYTES:
-            num_chunks = (d_eff + 127) // 128
             raise ValueError(
                 f"FMHA estimated staged SMEM {est} bytes exceeds budget "
                 f"{self.SMEM_BUDGET_BYTES} for D_mma={d_eff} (head_dim={self.head_dim}). "
-                f"D-chunking with {num_chunks} chunk(s) of 128 is required (P1); "
                 f"see study_cute/docs/support_d256.md"
             )
 

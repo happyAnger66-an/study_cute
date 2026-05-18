@@ -217,6 +217,11 @@ class BlackwellFusedMultiHeadAttentionForward:
             barrier_id=1,
             num_threads=self.threads_per_cta,
         )
+        # Load + MMA only (P1 D-chunk serializes between these two warps).
+        self.load_mma_sync_barrier = pipeline.NamedBarrier(
+            barrier_id=3,
+            num_threads=2 * self.threads_per_warp,
+        )
         self.tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=2,
             num_threads=self.threads_per_warp,
@@ -1251,7 +1256,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                     q0_coord = 2 * curr_block_coord_q[0]
                     q1_coord = q0_coord + 1
 
-                    # K0 prologue: all D chunks for Q/K, then V per chunk
+                    # K0 prologue: one D-chunk at a time (q_stage=2 cannot buffer all chunks).
                     for d_chunk_idx in cutlass.range_constexpr(self.num_d_chunks):
                         tQgQ = tQgQ_qdl[
                             None, None, d_chunk_idx, curr_block_coord_q[2]
@@ -1280,6 +1285,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                             tQsQ[None, q1_handle.index],
                             tma_bar_ptr=q1_handle.barrier,
                         )
+                        self.load_mma_sync_barrier.arrive_and_wait()
                     for d_chunk_idx in cutlass.range_constexpr(self.num_d_chunks):
                         tVgV = tVgV_dkl[
                             None, d_chunk_idx, None, curr_block_coord_kv[2]
@@ -1291,6 +1297,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                             tVsV[None, v_handle.index],
                             tma_bar_ptr=v_handle.barrier,
                         )
+                        self.load_mma_sync_barrier.arrive_and_wait()
                     kv_coord += 1
 
                     seqlen_kv_loop_steps = (
@@ -1336,6 +1343,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                                 tQsQ[None, q1_handle.index],
                                 tma_bar_ptr=q1_handle.barrier,
                             )
+                            self.load_mma_sync_barrier.arrive_and_wait()
                         for d_chunk_idx in cutlass.range_constexpr(
                             self.num_d_chunks
                         ):
@@ -1349,6 +1357,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                                 tVsV[None, v_handle.index],
                                 tma_bar_ptr=v_handle.barrier,
                             )
+                            self.load_mma_sync_barrier.arrive_and_wait()
                         kv_coord += 1
                     # End of seqlen_kv loop
 
@@ -1391,10 +1400,11 @@ class BlackwellFusedMultiHeadAttentionForward:
                         cuseqlen_k = cum_seqlen_k[batch_coord]
                         seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
 
-                    # GEMM_QK0*K0 -> S0/S1 and GEMM_PV00 over D chunks
+                    # GEMM_QK0*K0 -> S0/S1 (all D chunks), then GEMM_PV00 per chunk
                     s0_handle = mma_s0_producer.acquire_and_advance()
                     s1_handle = mma_s1_producer.acquire_and_advance()
                     for d_chunk_idx in cutlass.range_constexpr(self.num_d_chunks):
+                        self.load_mma_sync_barrier.arrive_and_wait()
                         q0_handle = load_q_consumer.wait_and_advance()
                         tSrQ0 = tSrQ[None, None, None, q0_handle.index]
                         k_handle = load_kv_consumer.wait_and_advance()
@@ -1438,6 +1448,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                     k_handle.release()
 
                     for d_chunk_idx in cutlass.range_constexpr(self.num_d_chunks):
+                        self.load_mma_sync_barrier.arrive_and_wait()
                         v_handle = load_kv_consumer.wait_and_advance()
                         tOrVi = tOrV[None, None, None, v_handle.index]
                         o0_handle = mma_corr_producer.acquire_and_advance()
@@ -1459,7 +1470,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                                 tOtO0,
                             )
                         o0_handle.commit()
-                    # End of K0 prologue (D chunks)
 
                     seqlen_kv_loop_steps = (
                         fmha_utils.FusedMask.get_trip_count(
@@ -1474,14 +1484,13 @@ class BlackwellFusedMultiHeadAttentionForward:
                         - 1
                     )
 
-                    # O1 hasn't been accumulated yet, its first MMA calculation doesn't need to accumulate
                     pv_whether_acc = False
                     for i in cutlass.range(0, seqlen_kv_loop_steps, 1, unroll=1):
                         s0_handle = mma_s0_producer.acquire_and_advance()
-                        s1_handle = mma_s1_producer.acquire_and_advance()
                         for d_chunk_idx in cutlass.range_constexpr(
                             self.num_d_chunks
                         ):
+                            self.load_mma_sync_barrier.arrive_and_wait()
                             k_handle = load_kv_consumer.wait_and_advance()
                             tSrKi = tSrK[None, None, None, k_handle.index]
                             q0_handle = load_q_consumer.wait_and_advance()
@@ -1502,35 +1511,16 @@ class BlackwellFusedMultiHeadAttentionForward:
                                     tSrKi[kphase_coord],
                                     tStS0,
                                 )
-                            q1_handle = load_q_consumer.wait_and_advance()
-                            tSrQ1 = tSrQ[None, None, None, q1_handle.index]
-                            inner_num_kphases = cute.size(tSrQ1, mode=[2])
-                            for kphase_idx in cutlass.range(
-                                inner_num_kphases, unroll_full=True
-                            ):
-                                kphase_coord = (None, None, kphase_idx)
-                                qk_tiled_mma.set(
-                                    tcgen05.Field.ACCUMULATE,
-                                    d_chunk_idx != 0 or kphase_idx != 0,
-                                )
-                                cute.gemm(
-                                    qk_tiled_mma,
-                                    tStS1,
-                                    tSrQ1[kphase_coord],
-                                    tSrKi[kphase_coord],
-                                    tStS1,
-                                )
                         s0_handle.commit()
-                        s1_handle.commit()
-                        k_handle.release()
 
+                        o1_handle = mma_corr_producer.acquire_and_advance()
+                        s1_handle = mma_s1_producer.acquire_and_advance()
                         for d_chunk_idx in cutlass.range_constexpr(
                             self.num_d_chunks
                         ):
+                            self.load_mma_sync_barrier.arrive_and_wait()
                             v_handle = load_kv_consumer.wait_and_advance()
                             tOrVi = tOrV[None, None, None, v_handle.index]
-                            o1_handle = mma_corr_producer.acquire_and_advance()
-                            s1_handle = mma_s1_producer.acquire_and_advance()
                             inner_num_kphases = cute.size(tOrP0, mode=[2])
                             for kphase_idx in cutlass.range(
                                 inner_num_kphases, unroll_full=True
@@ -1550,7 +1540,39 @@ class BlackwellFusedMultiHeadAttentionForward:
                                     tOtO1,
                                 )
                                 pv_whether_acc = True
-                            o1_handle.commit()
+                        o1_handle.commit()
+                        v_handle.release()
+                        for d_chunk_idx in cutlass.range_constexpr(
+                            self.num_d_chunks
+                        ):
+                            self.load_mma_sync_barrier.arrive_and_wait()
+                            q1_handle = load_q_consumer.wait_and_advance()
+                            tSrQ1 = tSrQ[None, None, None, q1_handle.index]
+                            inner_num_kphases = cute.size(tSrQ1, mode=[2])
+                            for kphase_idx in cutlass.range(
+                                inner_num_kphases, unroll_full=True
+                            ):
+                                kphase_coord = (None, None, kphase_idx)
+                                qk_tiled_mma.set(
+                                    tcgen05.Field.ACCUMULATE,
+                                    d_chunk_idx != 0 or kphase_idx != 0,
+                                )
+                                cute.gemm(
+                                    qk_tiled_mma,
+                                    tStS1,
+                                    tSrQ1[kphase_coord],
+                                    tSrKi[kphase_coord],
+                                    tStS1,
+                                )
+                            k_handle.release()
+                        s1_handle.commit()
+
+                        for d_chunk_idx in cutlass.range_constexpr(
+                            self.num_d_chunks
+                        ):
+                            self.load_mma_sync_barrier.arrive_and_wait()
+                            v_handle = load_kv_consumer.wait_and_advance()
+                            tOrVi = tOrV[None, None, None, v_handle.index]
                             o0_handle = mma_corr_producer.acquire_and_advance()
                             s0_handle = mma_s0_producer.acquire_and_advance()
                             inner_num_kphases = cute.size(tOrP0, mode=[2])
@@ -1570,14 +1592,12 @@ class BlackwellFusedMultiHeadAttentionForward:
                                     tOtO0,
                                 )
                             o0_handle.commit()
-                        v_handle.release()
-                    # End of seqlen_kv loop
 
-                    # release Q0 & Q1
                     q0_handle.release()
                     q1_handle.release()
 
                     for d_chunk_idx in cutlass.range_constexpr(self.num_d_chunks):
+                        self.load_mma_sync_barrier.arrive_and_wait()
                         v_handle = load_kv_consumer.wait_and_advance()
                         tOrVi = tOrV[None, None, None, v_handle.index]
                         o1_handle = mma_corr_producer.acquire_and_advance()
@@ -1602,7 +1622,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                         o1_handle.commit()
                     v_handle.release()
 
-                    # Commit S0 and S1
                     s0_handle.commit()
                     s1_handle.commit()
 
@@ -1669,31 +1688,55 @@ class BlackwellFusedMultiHeadAttentionForward:
                     gO_qdl = cute.flat_divide(
                         mO_qdl_, cute.select(self.pv_mma_tiler, mode=[0, 1])
                     )
-                    for d_chunk_idx in cutlass.range_constexpr(self.num_d_chunks):
-                        gO = gO_qdl[
-                            None, None, None, d_chunk_idx, curr_block_coord_o[2]
-                        ]
-                        tOsO, tOgO = cute.nvgpu.cpasync.tma_partition(
-                            tma_atom_o,
-                            0,
-                            cute.make_layout(1),
-                            cute.group_modes(sO, 0, 2),
-                            cute.group_modes(gO, 0, 2),
-                        )
-                        o0_handle = corr_epi_consumer.wait_and_advance()
-                        cute.copy(
-                            tma_atom_o, tOsO[None, 0], tOgO[None, o0_coord]
-                        )
-                        cute.arch.cp_async_bulk_commit_group()
-                        o1_handle = corr_epi_consumer.wait_and_advance()
-                        cute.copy(
-                            tma_atom_o, tOsO[None, 1], tOgO[None, o1_coord]
-                        )
-                        cute.arch.cp_async_bulk_commit_group()
-                        cute.arch.cp_async_bulk_wait_group(1, read=True)
-                        o0_handle.release()
-                        cute.arch.cp_async_bulk_wait_group(0, read=True)
-                        o1_handle.release()
+                    gO = gO_qdl[
+                        None, None, None, 0, curr_block_coord_o[2]
+                    ]
+                    tOsO, tOgO = cute.nvgpu.cpasync.tma_partition(
+                        tma_atom_o,
+                        0,
+                        cute.make_layout(1),
+                        cute.group_modes(sO, 0, 2),
+                        cute.group_modes(gO, 0, 2),
+                    )
+                    o0_handle = corr_epi_consumer.wait_and_advance()
+                    cute.copy(
+                        tma_atom_o, tOsO[None, 0], tOgO[None, o0_coord]
+                    )
+                    cute.arch.cp_async_bulk_commit_group()
+                    o1_handle = corr_epi_consumer.wait_and_advance()
+                    cute.copy(
+                        tma_atom_o, tOsO[None, 1], tOgO[None, o1_coord]
+                    )
+                    cute.arch.cp_async_bulk_commit_group()
+                    cute.arch.cp_async_bulk_wait_group(1, read=True)
+                    o0_handle.release()
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+                    o1_handle.release()
+                    if cutlass.const_expr(self.num_d_chunks > 1):
+                        for d_chunk_idx in cutlass.range_constexpr(
+                            self.num_d_chunks - 1
+                        ):
+                            d_idx = d_chunk_idx + 1
+                            gO = gO_qdl[
+                                None, None, None, d_idx, curr_block_coord_o[2]
+                            ]
+                            _, tOgO = cute.nvgpu.cpasync.tma_partition(
+                                tma_atom_o,
+                                0,
+                                cute.make_layout(1),
+                                cute.group_modes(sO, 0, 2),
+                                cute.group_modes(gO, 0, 2),
+                            )
+                            cute.copy(
+                                tma_atom_o, tOsO[None, 0], tOgO[None, o0_coord]
+                            )
+                            cute.arch.cp_async_bulk_commit_group()
+                            cute.copy(
+                                tma_atom_o, tOsO[None, 1], tOgO[None, o1_coord]
+                            )
+                            cute.arch.cp_async_bulk_commit_group()
+                            cute.arch.cp_async_bulk_wait_group(1, read=True)
+                            cute.arch.cp_async_bulk_wait_group(0, read=True)
 
                 # Advance to next tile
                 tile_sched.advance_to_next_work()
@@ -1845,98 +1888,94 @@ class BlackwellFusedMultiHeadAttentionForward:
                         - 1
                     )
                     for i in cutlass.range(0, seqlen_kv_loop_steps, 1, unroll=1):
-                        for d_chunk_idx in cutlass.range_constexpr(
-                            self.num_d_chunks
-                        ):
-                            vec0_handle = s0_corr_consumer.wait_and_advance()
-                            tTMEM_LOAD_VECrS = cute.make_rmem_tensor(
-                                tTMEM_LOAD_VECcS.shape, self.qk_acc_dtype
-                            )
-                            cute.copy(
-                                tiled_tmem_load_vec,
-                                tTMEM_LOAD_VECtS0,
-                                tTMEM_LOAD_VECrS,
-                            )
-                            scale_ = scale_softmax_log2 * (
-                                tTMEM_LOAD_VECrS[0] - tTMEM_LOAD_VECrS[1]
-                            )
-                            scale = cute.math.exp2(scale_, fastmath=True)
-                            o0_handle = mma_corr_consumer.wait_and_advance()
-                            self.correction_rescale(pv_thr_mma, tOtO0, scale)
-                            vec1_handle.release()
-                            cute.arch.fence_view_async_tmem_store()
-                            o0_handle.release()
-
-                            vec1_handle = s1_corr_consumer.wait_and_advance()
-                            cute.copy(
-                                tiled_tmem_load_vec,
-                                tTMEM_LOAD_VECtS1,
-                                tTMEM_LOAD_VECrS,
-                            )
-                            scale_ = scale_softmax_log2 * (
-                                tTMEM_LOAD_VECrS[0] - tTMEM_LOAD_VECrS[1]
-                            )
-                            scale = cute.math.exp2(scale_, fastmath=True)
-                            o1_handle = mma_corr_consumer.wait_and_advance()
-                            self.correction_rescale(pv_thr_mma, tOtO1, scale)
-                            vec0_handle.release()
-                            cute.arch.fence_view_async_tmem_store()
-                            o1_handle.release()
-                    # End of seqlen_corr_loop_steps
-                    vec1_handle.release()
-
-                    for d_chunk_idx in cutlass.range_constexpr(self.num_d_chunks):
                         vec0_handle = s0_corr_consumer.wait_and_advance()
                         tTMEM_LOAD_VECrS = cute.make_rmem_tensor(
                             tTMEM_LOAD_VECcS.shape, self.qk_acc_dtype
                         )
                         cute.copy(
-                            tiled_tmem_load_vec, tTMEM_LOAD_VECtS0, tTMEM_LOAD_VECrS
-                        )
-                        cute.arch.fence_view_async_tmem_load()
-                        vec0_handle.release()
-                        o0_handle = mma_corr_consumer.wait_and_advance()
-                        o0_final_handle = corr_epi_producer.acquire_and_advance()
-                        self.correction_epilog(
-                            pv_thr_mma,
-                            tOtO0,
-                            mLSE,
+                            tiled_tmem_load_vec,
+                            tTMEM_LOAD_VECtS0,
                             tTMEM_LOAD_VECrS,
-                            row_idx,
-                            cuseqlen_q,
-                            seqlen_q,
-                            curr_block_coord_lse,
-                            scale_softmax,
-                            scale_output / tTMEM_LOAD_VECrS[0],
-                            sO[None, None, 0],
                         )
+                        scale_ = scale_softmax_log2 * (
+                            tTMEM_LOAD_VECrS[0] - tTMEM_LOAD_VECrS[1]
+                        )
+                        scale = cute.math.exp2(scale_, fastmath=True)
+                        o0_handle = mma_corr_consumer.wait_and_advance()
+                        self.correction_rescale(pv_thr_mma, tOtO0, scale)
+                        vec1_handle.release()
+                        cute.arch.fence_view_async_tmem_store()
                         o0_handle.release()
-                        o0_final_handle.commit()
 
                         vec1_handle = s1_corr_consumer.wait_and_advance()
                         cute.copy(
-                            tiled_tmem_load_vec, tTMEM_LOAD_VECtS1, tTMEM_LOAD_VECrS
-                        )
-                        cute.arch.fence_view_async_tmem_load()
-                        vec1_handle.release()
-                        o1_handle = mma_corr_consumer.wait_and_advance()
-                        o1_final_handle = corr_epi_producer.acquire_and_advance()
-                        row_idx_o1 = row_idx + self.qk_mma_tiler[0]
-                        self.correction_epilog(
-                            pv_thr_mma,
-                            tOtO1,
-                            mLSE,
+                            tiled_tmem_load_vec,
+                            tTMEM_LOAD_VECtS1,
                             tTMEM_LOAD_VECrS,
-                            row_idx_o1,
-                            cuseqlen_q,
-                            seqlen_q,
-                            curr_block_coord_lse,
-                            scale_softmax,
-                            scale_output / tTMEM_LOAD_VECrS[0],
-                            sO[None, None, 1],
                         )
+                        scale_ = scale_softmax_log2 * (
+                            tTMEM_LOAD_VECrS[0] - tTMEM_LOAD_VECrS[1]
+                        )
+                        scale = cute.math.exp2(scale_, fastmath=True)
+                        o1_handle = mma_corr_consumer.wait_and_advance()
+                        self.correction_rescale(pv_thr_mma, tOtO1, scale)
+                        vec0_handle.release()
+                        cute.arch.fence_view_async_tmem_store()
                         o1_handle.release()
-                        o1_final_handle.commit()
+                    # End of seqlen_corr_loop_steps
+                    vec1_handle.release()
+
+                    vec0_handle = s0_corr_consumer.wait_and_advance()
+                    tTMEM_LOAD_VECrS = cute.make_rmem_tensor(
+                        tTMEM_LOAD_VECcS.shape, self.qk_acc_dtype
+                    )
+                    cute.copy(
+                        tiled_tmem_load_vec, tTMEM_LOAD_VECtS0, tTMEM_LOAD_VECrS
+                    )
+                    cute.arch.fence_view_async_tmem_load()
+                    vec0_handle.release()
+                    o0_handle = mma_corr_consumer.wait_and_advance()
+                    o0_final_handle = corr_epi_producer.acquire_and_advance()
+                    self.correction_epilog(
+                        pv_thr_mma,
+                        tOtO0,
+                        mLSE,
+                        tTMEM_LOAD_VECrS,
+                        row_idx,
+                        cuseqlen_q,
+                        seqlen_q,
+                        curr_block_coord_lse,
+                        scale_softmax,
+                        scale_output / tTMEM_LOAD_VECrS[0],
+                        sO[None, None, 0],
+                    )
+                    o0_handle.release()
+                    o0_final_handle.commit()
+
+                    vec1_handle = s1_corr_consumer.wait_and_advance()
+                    cute.copy(
+                        tiled_tmem_load_vec, tTMEM_LOAD_VECtS1, tTMEM_LOAD_VECrS
+                    )
+                    cute.arch.fence_view_async_tmem_load()
+                    vec1_handle.release()
+                    o1_handle = mma_corr_consumer.wait_and_advance()
+                    o1_final_handle = corr_epi_producer.acquire_and_advance()
+                    row_idx_o1 = row_idx + self.qk_mma_tiler[0]
+                    self.correction_epilog(
+                        pv_thr_mma,
+                        tOtO1,
+                        mLSE,
+                        tTMEM_LOAD_VECrS,
+                        row_idx_o1,
+                        cuseqlen_q,
+                        seqlen_q,
+                        curr_block_coord_lse,
+                        scale_softmax,
+                        scale_output / tTMEM_LOAD_VECrS[0],
+                        sO[None, None, 1],
+                    )
+                    o1_handle.release()
+                    o1_final_handle.commit()
                 # Advance to next tile
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()

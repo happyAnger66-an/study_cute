@@ -107,6 +107,8 @@ def make_thread_cooperative_group(size: int):
 
 class BlackwellFusedMultiHeadAttentionForward:
     WINDOW_NO_LIMIT = 1 << 30
+    # Blackwell per-CTA dynamic SMEM ~227KB; leave margin for barriers/alignment.
+    SMEM_BUDGET_BYTES = 220 * 1024
 
     def __init__(
         self,
@@ -237,6 +239,81 @@ class BlackwellFusedMultiHeadAttentionForward:
             // num_warps_per_warpgroup
         )
 
+    def _pick_pipeline_stages(self, d_eff: int) -> None:
+        """Choose q/kv/epi stages from padded head dim (mma K) to stay under SMEM budget.
+
+        See study_cute/docs/support_d256.md (P0).
+        """
+        is_fp8 = self.q_dtype.width == 8
+        if d_eff <= 128:
+            self.q_stage = 2
+            self.kv_stage = 4 if is_fp8 else 3
+            self.epi_stage = 2
+        elif d_eff <= 160:
+            self.q_stage = 1
+            self.kv_stage = 3 if is_fp8 else 2
+            self.epi_stage = 1
+        elif d_eff <= 176:
+            self.q_stage = 1
+            self.kv_stage = 2
+            self.epi_stage = 1
+        else:
+            self.q_stage = 1
+            self.kv_stage = 2 if is_fp8 else 1
+            self.epi_stage = 1
+
+    @staticmethod
+    def _estimate_staged_smem_bytes(
+        d_eff: int,
+        elem_bytes: int,
+        q_stage: int,
+        kv_stage: int,
+        epi_stage: int,
+        cta_m: int,
+        n_tile: int,
+        epi_m: int,
+    ) -> int:
+        """Conservative staged Q+K(V)+O SMEM (barriers/swizzle extra not included)."""
+        return elem_bytes * (
+            q_stage * cta_m * d_eff
+            + kv_stage * n_tile * d_eff
+            + epi_stage * epi_m * d_eff
+        )
+
+    def validate_config_host(self, q_dtype: Type[cutlass.Numeric]) -> None:
+        """Fail fast before cute.compile if staged SMEM likely exceeds GPU limit."""
+        self.q_dtype = q_dtype
+        d_eff = self.qk_mma_tiler[2]
+        self._pick_pipeline_stages(d_eff)
+        elem_bytes = max(1, q_dtype.width // 8)
+        cta_m = 2 * self.qk_mma_tiler[0]
+        n_tile = self.qk_mma_tiler[1]
+        epi_m = self.qk_mma_tiler[0]
+        est = self._estimate_staged_smem_bytes(
+            d_eff,
+            elem_bytes,
+            self.q_stage,
+            self.kv_stage,
+            self.epi_stage,
+            cta_m,
+            n_tile,
+            epi_m,
+        )
+        if d_eff > 128:
+            print(
+                f"[fmha] D_mma={d_eff} (head_dim={self.head_dim}): "
+                f"stages q={self.q_stage} kv={self.kv_stage} epi={self.epi_stage}, "
+                f"estimated staged SMEM={est} bytes (budget {self.SMEM_BUDGET_BYTES})"
+            )
+        if est > self.SMEM_BUDGET_BYTES:
+            num_chunks = (d_eff + 127) // 128
+            raise ValueError(
+                f"FMHA estimated staged SMEM {est} bytes exceeds budget "
+                f"{self.SMEM_BUDGET_BYTES} for D_mma={d_eff} (head_dim={self.head_dim}). "
+                f"D-chunking with {num_chunks} chunk(s) of 128 is required (P1); "
+                f"see study_cute/docs/support_d256.md"
+            )
+
     def _setup_attributes(self):
         """Set up configurations and parameters for the FMHA kernel operation.
 
@@ -247,13 +324,11 @@ class BlackwellFusedMultiHeadAttentionForward:
         - Configures pipeline stages for softmax, correction, and epilogue operations
         """
 
-        self.q_stage = 2
-        self.kv_stage = 4 if self.q_dtype.width == 8 else 3
+        self._pick_pipeline_stages(self.qk_mma_tiler[2])
         self.acc_stage = 1
         self.softmax_corr_stage = 1
         self.mma_corr_stage = 2
         self.mma_softmax_stage = 1
-        self.epi_stage = 2
 
         # Pre-scale softmax output by 2^FP8_E4M3_PRESCALE_LOG2=256 for FP8 to maximize
         # E4M3 dynamic range.
@@ -2934,6 +3009,7 @@ def run(
         use_sliding_window=(use_sliding_window and not vit_mode),
         actual_head_dim=actual_head_dim,
     )
+    fmha.validate_config_host(in_dtype)
 
     # Initialize Stream
     current_stream = cuda.CUstream(cp.cuda.get_current_stream().ptr)
@@ -3423,6 +3499,7 @@ def run_llm_multi_round_prefill_test(
         is_causal=is_causal,
         actual_head_dim=actual_head_dim,
     )
+    fmha_op.validate_config_host(cutlass.Float16)
     current_stream = cuda.CUstream(cp.cuda.get_current_stream().ptr)
     _wsl = Int32(window_size_left_val) if use_sliding_window else Int32(0)
 

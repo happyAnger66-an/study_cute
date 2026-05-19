@@ -3,6 +3,7 @@
 | 文档 | 内容 |
 |------|------|
 | **[`tma_v0.md`](tma_v0.md)** | `tma_v0.py` **完整逐段分析**（host、mbarrier、partition、load/store、时间线图） |
+| **[`barrier.md`](barrier.md)** | **Named Barrier vs mbarrier**（区别、作用范围、使用场景、`tma_v1` 对照） |
 | [`docs/tma.md`](../docs/tma.md) | TMA 通用概念 + GEMM 多 stage pipeline |
 
 下文为速查摘要；细节以 [`tma_v0.md`](tma_v0.md) 为准。

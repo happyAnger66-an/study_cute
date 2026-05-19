@@ -1,0 +1,17 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../../sources/e2e/cutlass"
+		},
+		{
+			"path": "../../sources/opensrc/TensorRT-Edge-LLM"
+		},
+		{
+			"path": "../../sources/e2e/TensorRT-LLM"
+		}
+	],
+	"settings": {}
+}

@@ -11,6 +11,9 @@
 		},
 		{
 			"path": "../../sources/e2e/TensorRT-LLM"
+		},
+		{
+			"path": "../cutlass"
 		}
 	],
 	"settings": {}

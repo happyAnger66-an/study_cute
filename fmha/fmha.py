@@ -217,11 +217,8 @@ class BlackwellFusedMultiHeadAttentionForward:
             barrier_id=1,
             num_threads=self.threads_per_cta,
         )
-        # Load + MMA only (P1 D-chunk serializes between these two warps).
-        self.load_mma_sync_barrier = pipeline.NamedBarrier(
-            barrier_id=3,
-            num_threads=2 * self.threads_per_warp,
-        )
+        # P1 D-chunk: serialize Load vs MMA via PipelineTmaUmma acquire/release only
+        # (no NamedBarrier between warps — persistent scheduling desyncs tile phases).
         self.tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=2,
             num_threads=self.threads_per_warp,
@@ -1286,7 +1283,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                             tQsQ[None, q1_handle.index],
                             tma_bar_ptr=q1_handle.barrier,
                         )
-                        self.load_mma_sync_barrier.arrive_and_wait()
                     for d_chunk_idx in cutlass.range_constexpr(self.num_d_chunks):
                         tVgV = tVgV_dkl[
                             None, d_chunk_idx, None, curr_block_coord_kv[2]
@@ -1298,7 +1294,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                             tVsV[None, v_handle.index],
                             tma_bar_ptr=v_handle.barrier,
                         )
-                        self.load_mma_sync_barrier.arrive_and_wait()
                     kv_coord += 1
 
                     seqlen_kv_loop_steps = (
@@ -1344,7 +1339,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                                 tQsQ[None, q1_handle.index],
                                 tma_bar_ptr=q1_handle.barrier,
                             )
-                            self.load_mma_sync_barrier.arrive_and_wait()
                         for d_chunk_idx in cutlass.range_constexpr(
                             self.num_d_chunks
                         ):
@@ -1358,7 +1352,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                                 tVsV[None, v_handle.index],
                                 tma_bar_ptr=v_handle.barrier,
                             )
-                            self.load_mma_sync_barrier.arrive_and_wait()
                         kv_coord += 1
                     # End of seqlen_kv loop
 
@@ -1405,7 +1398,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                     s0_handle = mma_s0_producer.acquire_and_advance()
                     s1_handle = mma_s1_producer.acquire_and_advance()
                     for d_chunk_idx in cutlass.range_constexpr(self.num_d_chunks):
-                        self.load_mma_sync_barrier.arrive_and_wait()
                         q0_handle = load_q_consumer.wait_and_advance()
                         tSrQ0 = tSrQ[None, None, None, q0_handle.index]
                         k_handle = load_kv_consumer.wait_and_advance()
@@ -1452,7 +1444,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                     s1_handle.commit()
 
                     for d_chunk_idx in cutlass.range_constexpr(self.num_d_chunks):
-                        self.load_mma_sync_barrier.arrive_and_wait()
                         v_handle = load_kv_consumer.wait_and_advance()
                         tOrVi = tOrV[None, None, None, v_handle.index]
                         o0_handle = mma_corr_producer.acquire_and_advance()
@@ -1498,7 +1489,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                         for d_chunk_idx in cutlass.range_constexpr(
                             self.num_d_chunks
                         ):
-                            self.load_mma_sync_barrier.arrive_and_wait()
                             k_handle = load_kv_consumer.wait_and_advance()
                             tSrKi = tSrK[None, None, None, k_handle.index]
                             q0_handle = load_q_consumer.wait_and_advance()
@@ -1541,7 +1531,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                             q0_handle.release()
                             q1_handle.release()
 
-                            self.load_mma_sync_barrier.arrive_and_wait()
                             v_handle = load_kv_consumer.wait_and_advance()
                             tOrVi = tOrV[None, None, None, v_handle.index]
                             inner_num_kphases = cute.size(tOrP0, mode=[2])
@@ -1585,33 +1574,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                         s0_handle.commit()
                         o1_handle.commit()
                         s1_handle.commit()
-
-                    for d_chunk_idx in cutlass.range_constexpr(self.num_d_chunks):
-                        self.load_mma_sync_barrier.arrive_and_wait()
-                        v_handle = load_kv_consumer.wait_and_advance()
-                        tOrVi = tOrV[None, None, None, v_handle.index]
-                        o1_handle = mma_corr_producer.acquire_and_advance()
-                        s1_handle = mma_s1_producer.acquire_and_advance()
-                        num_kphases = cute.size(tOrP1, mode=[2])
-                        for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
-                            kphase_coord = (None, None, kphase_idx)
-                            pv_tiled_mma.set(
-                                tcgen05.Field.ACCUMULATE,
-                                pv_whether_acc
-                                or d_chunk_idx != 0
-                                or kphase_idx != 0,
-                            )
-                            cute.gemm(
-                                pv_tiled_mma,
-                                tOtO1,
-                                tOrP1[kphase_coord],
-                                tOrVi[kphase_coord],
-                                tOtO1,
-                            )
-                            pv_whether_acc = True
-                        o1_handle.commit()
-                        v_handle.release()
-                    s1_handle.commit()
 
                 # Advance to next tile
                 tile_sched.advance_to_next_work()

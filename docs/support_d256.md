@@ -53,12 +53,16 @@ python3 fmha/fmha.py --q_shape 1,968,8,256 --k_shape 1,968,1,256
 
 ### P1 挂死修复（D=256 pipeline 死锁）
 
-**根因**：`num_d_chunks=2` 时 Load/MMA 在 `d_chunk` 循环里多次 `acquire`，但 `q_stage=2`、`kv_stage=3` 有限；MMA 侧未及时 `release`，第二个 chunk 永久阻塞（与 `tma_v1` 中 mbarrier/NB 超配类似，属 **Pipeline stage 计数** 问题）。
+**根因（两层）**：
 
-**修复**（MMA warp）：
-- Prologue / 主循环：每个 `d_chunk` 完成 QK（K+Q0+Q1）后 `release` K/Q；完成 PV 后 `release` V。
-- 主循环 `for i`：按 chunk 串行 `load_mma_sync` → QK → `release` → V → O1/O0 → `release` V（同一 chunk 内复用 V 做 O1+O0）。
-- 保持 `q_stage=2`，不做 stage 缩减（`q_stage=1` 会双 Q tile 死锁，见 `d_256.md`）。
+1. **Pipeline stage 用尽**：`num_d_chunks=2` 时每个 KV step 对 `load_q` 要 `2×(Q0+Q1)=4` 次 `acquire`，但 `q_stage=2`；MMA 必须在每个 `d_chunk` 后 `release` K/Q/V。
+2. **`load_mma_sync_barrier` 误用（主因挂死）**：Load warp 在 persistent 调度里**先于** MMA 进入下一 tile，而 MMA 仍在上一 tile 的 `arrive_and_wait` 上等待 → **跨 tile 屏障配对失败，永久挂死**。上游 Blackwell `fmha.py` **从不**在 Load/MMA 之间使用 NamedBarrier，只靠 `PipelineTmaUmma` 的 acquire 背压 + consumer `release`。
+
+**修复**：
+- **删除**全部 `load_mma_sync_barrier.arrive_and_wait()`（Load/MMA 两侧）。
+- MMA：每个 `d_chunk` 完成 QK（K+Q0+Q1）后 `release`；同一 `V` 上完成 O1+O0 后 `release` V。
+- **删除**尾部多余的 `GEMM_PV1(i_end)` d_chunk 循环（会对已 advance 的 Load tile 再次 `wait` V）；D>1 的最终 P×V 已在主循环 `for i` 内按 chunk 完成。
+- 保持 `q_stage=2`，不缩减 stage（`q_stage=1` 会双 Q tile 死锁）。
 
 - Host：`D_CHUNK=128`，`mma_tiler` 第三维恒为 128，`actual_head_dim` 为真实 D，`num_d_chunks=ceil(D/128)`。
 - Load/MMA/Correction/Epilogue：对 `d_chunk_idx` 循环；QK 跨 chunk 累加 S；PV 跨 chunk 累加 O（`ACCUMULATE` 含 `d_chunk_idx != 0`）；Epilogue 写 `gO[..., d_chunk_idx, ...]`。

@@ -57,15 +57,19 @@ python3 fmha/fmha.py --q_shape 1,968,8,256 --k_shape 1,968,1,256
 
 1. **`load_mma_sync_barrier` 误用**：persistent 下 Load 已 `advance` 到下一 tile，MMA 仍在上一 tile `arrive_and_wait` → 永久挂死。已**全部删除**；上游从不使用此 barrier。
 2. **Q pipeline 被撑爆（主因之一）**：旧实现在**每个 KV step × 每个 d_chunk** 都 `acquire` Q0/Q1。`q_stage=2` 只能容纳 2 个 Q buffer，968/128≈8 步时单 tile 约 **32 次 Q acquire** → 必然死锁。
-3. **正确模式（与上游 Blackwell fmha 一致）**：
-   - **每个 D-chunk**：Q0/Q1 只加载 **一次**，贯穿该 chunk 的**整段 KV 扫描**
-   - **每个 KV step**：只加载当前 chunk 的 K、V
-   - **外层 `for d_chunk_idx`**：chunk0 扫完全部 KV 累加 S，再 chunk1 扫完全部 KV
+3. **Softmax/Correction trip 不匹配（本次挂死主因）**：
+   - Softmax/Correction 每个 KV tile 只 `wait` **一次** `mma_s0/s1`
+   - 错误实现：外层 `for d_chunk` 包住**整段 KV**，每个 KV step 产生 **num_d_chunks 次** `s0/s1 commit`
+   - D=256、8 个 KV step → Softmax 等 8 次，MMA 提交 16 次 → **mma_s0 pipeline 死锁**（GPU 98%、host 卡在 `cuEventSynchronize`）
+
+**正确循环顺序**：
+- **KV 外层 / D-chunk 内层**：每个 KV step 内累加全部 D-chunk 的 QK，再 **一次** `s0/s1 commit`
+- Load：每个 `kv_coord` 先 `for d` 加载 Q+K，再 `for d` 加载 V
 
 **修复（当前实现）**：
-- Load/MMA 均改为「**per d_chunk 整遍 KV** + Q 只 load/wait 一次」
-- MMA 主循环恢复上游 **GEMM_QK0i → PV1 → GEMM_QK1i → PV0i → PV1(i_end)** 顺序
-- `q0/q1.release()` 放在每个 d_chunk 的 KV 循环结束后（与上游一致）
+- Load/MMA 改为 KV 外层、D-chunk 内层
+- 每个 KV step：所有 d 完成 QK0（及 QK1）后 **一次** commit S
+- 保持上游 **QK → PV1 → PV0** 交错（PV 按 d_chunk 累加 O）
 
 - Host：`D_CHUNK=128`，`mma_tiler` 第三维恒为 128，`actual_head_dim` 为真实 D，`num_d_chunks=ceil(D/128)`。
 - Load/MMA/Correction/Epilogue：对 `d_chunk_idx` 循环；QK 跨 chunk 累加 S；PV 跨 chunk 累加 O（`ACCUMULATE` 含 `d_chunk_idx != 0`）；Epilogue 写 `gO[..., d_chunk_idx, ...]`。

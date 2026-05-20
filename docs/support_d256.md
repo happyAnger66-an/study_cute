@@ -51,6 +51,15 @@ python3 fmha/fmha.py --q_shape 1,968,8,256 --k_shape 1,968,1,256
 
 实现文件：`study_cute/fmha/fmha.py`。
 
+### P1 挂死修复（D=256 pipeline 死锁）
+
+**根因**：`num_d_chunks=2` 时 Load/MMA 在 `d_chunk` 循环里多次 `acquire`，但 `q_stage=2`、`kv_stage=3` 有限；MMA 侧未及时 `release`，第二个 chunk 永久阻塞（与 `tma_v1` 中 mbarrier/NB 超配类似，属 **Pipeline stage 计数** 问题）。
+
+**修复**（MMA warp）：
+- Prologue / 主循环：每个 `d_chunk` 完成 QK（K+Q0+Q1）后 `release` K/Q；完成 PV 后 `release` V。
+- 主循环 `for i`：按 chunk 串行 `load_mma_sync` → QK → `release` → V → O1/O0 → `release` V（同一 chunk 内复用 V 做 O1+O0）。
+- 保持 `q_stage=2`，不做 stage 缩减（`q_stage=1` 会双 Q tile 死锁，见 `d_256.md`）。
+
 - Host：`D_CHUNK=128`，`mma_tiler` 第三维恒为 128，`actual_head_dim` 为真实 D，`num_d_chunks=ceil(D/128)`。
 - Load/MMA/Correction/Epilogue：对 `d_chunk_idx` 循环；QK 跨 chunk 累加 S；PV 跨 chunk 累加 O（`ACCUMULATE` 含 `d_chunk_idx != 0`）；Epilogue 写 `gO[..., d_chunk_idx, ...]`。
 - `inv_sqrt_head_dim` 仍用完整 `head_dim`。

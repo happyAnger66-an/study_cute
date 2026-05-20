@@ -53,16 +53,19 @@ python3 fmha/fmha.py --q_shape 1,968,8,256 --k_shape 1,968,1,256
 
 ### P1 挂死修复（D=256 pipeline 死锁）
 
-**根因（两层）**：
+**根因（最终确认）**：
 
-1. **Pipeline stage 用尽**：`num_d_chunks=2` 时每个 KV step 对 `load_q` 要 `2×(Q0+Q1)=4` 次 `acquire`，但 `q_stage=2`；MMA 必须在每个 `d_chunk` 后 `release` K/Q/V。
-2. **`load_mma_sync_barrier` 误用（主因挂死）**：Load warp 在 persistent 调度里**先于** MMA 进入下一 tile，而 MMA 仍在上一 tile 的 `arrive_and_wait` 上等待 → **跨 tile 屏障配对失败，永久挂死**。上游 Blackwell `fmha.py` **从不**在 Load/MMA 之间使用 NamedBarrier，只靠 `PipelineTmaUmma` 的 acquire 背压 + consumer `release`。
+1. **`load_mma_sync_barrier` 误用**：persistent 下 Load 已 `advance` 到下一 tile，MMA 仍在上一 tile `arrive_and_wait` → 永久挂死。已**全部删除**；上游从不使用此 barrier。
+2. **Q pipeline 被撑爆（主因之一）**：旧实现在**每个 KV step × 每个 d_chunk** 都 `acquire` Q0/Q1。`q_stage=2` 只能容纳 2 个 Q buffer，968/128≈8 步时单 tile 约 **32 次 Q acquire** → 必然死锁。
+3. **正确模式（与上游 Blackwell fmha 一致）**：
+   - **每个 D-chunk**：Q0/Q1 只加载 **一次**，贯穿该 chunk 的**整段 KV 扫描**
+   - **每个 KV step**：只加载当前 chunk 的 K、V
+   - **外层 `for d_chunk_idx`**：chunk0 扫完全部 KV 累加 S，再 chunk1 扫完全部 KV
 
-**修复**：
-- **删除**全部 `load_mma_sync_barrier.arrive_and_wait()`（Load/MMA 两侧）。
-- MMA：每个 `d_chunk` 完成 QK（K+Q0+Q1）后 `release`；同一 `V` 上完成 O1+O0 后 `release` V。
-- **删除**尾部多余的 `GEMM_PV1(i_end)` d_chunk 循环（会对已 advance 的 Load tile 再次 `wait` V）；D>1 的最终 P×V 已在主循环 `for i` 内按 chunk 完成。
-- 保持 `q_stage=2`，不缩减 stage（`q_stage=1` 会双 Q tile 死锁）。
+**修复（当前实现）**：
+- Load/MMA 均改为「**per d_chunk 整遍 KV** + Q 只 load/wait 一次」
+- MMA 主循环恢复上游 **GEMM_QK0i → PV1 → GEMM_QK1i → PV0i → PV1(i_end)** 顺序
+- `q0/q1.release()` 放在每个 d_chunk 的 KV 循环结束后（与上游一致）
 
 - Host：`D_CHUNK=128`，`mma_tiler` 第三维恒为 128，`actual_head_dim` 为真实 D，`num_d_chunks=ceil(D/128)`。
 - Load/MMA/Correction/Epilogue：对 `d_chunk_idx` 循环；QK 跨 chunk 累加 S；PV 跨 chunk 累加 O（`ACCUMULATE` 含 `d_chunk_idx != 0`）；Epilogue 写 `gO[..., d_chunk_idx, ...]`。

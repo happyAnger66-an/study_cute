@@ -1242,6 +1242,9 @@ class BlackwellFusedMultiHeadAttentionForward:
                         cute.group_modes(tSgV_dkl, 0, 3),
                     )
 
+                    q0_coord = 2 * curr_block_coord_q[0]
+                    q1_coord = q0_coord + 1
+
                     seqlen_kv_loop_start = fmha_utils.FusedMask.get_trip_start(
                         self.mask_type,
                         curr_block_coord,
@@ -1250,11 +1253,20 @@ class BlackwellFusedMultiHeadAttentionForward:
                         seqlen_k,
                         window_size_left,
                     )
-                    kv_coord = seqlen_kv_loop_start
-                    q0_coord = 2 * curr_block_coord_q[0]
-                    q1_coord = q0_coord + 1
+                    seqlen_kv_loop_steps = (
+                        fmha_utils.FusedMask.get_trip_count(
+                            self.mask_type,
+                            curr_block_coord,
+                            self.cta_tiler,
+                            seqlen_q,
+                            seqlen_k,
+                            window_size_left,
+                            window_size_right,
+                        )
+                        - 1
+                    )
 
-                    # K0 prologue: one D-chunk at a time (q_stage=2 cannot buffer all chunks).
+                    # P1: Q once per D-chunk (q_stage=2); full KV scan per chunk for K/V only.
                     for d_chunk_idx in cutlass.range_constexpr(self.num_d_chunks):
                         tQgQ = tQgQ_qdl[
                             None, None, d_chunk_idx, curr_block_coord_q[2]
@@ -1262,13 +1274,10 @@ class BlackwellFusedMultiHeadAttentionForward:
                         tKgK = tKgK_kdl[
                             None, None, d_chunk_idx, curr_block_coord_kv[2]
                         ]
-                        k_handle = load_kv_producer.acquire_and_advance()
-                        cute.copy(
-                            tma_atom_k,
-                            tKgK[None, kv_coord],
-                            tKsK[None, k_handle.index],
-                            tma_bar_ptr=k_handle.barrier,
-                        )
+                        tVgV = tVgV_dkl[
+                            None, d_chunk_idx, None, curr_block_coord_kv[2]
+                        ]
+
                         q0_handle = load_q_producer.acquire_and_advance()
                         cute.copy(
                             tma_atom_q,
@@ -1283,10 +1292,16 @@ class BlackwellFusedMultiHeadAttentionForward:
                             tQsQ[None, q1_handle.index],
                             tma_bar_ptr=q1_handle.barrier,
                         )
-                    for d_chunk_idx in cutlass.range_constexpr(self.num_d_chunks):
-                        tVgV = tVgV_dkl[
-                            None, d_chunk_idx, None, curr_block_coord_kv[2]
-                        ]
+
+                        kv_coord = seqlen_kv_loop_start
+
+                        k_handle = load_kv_producer.acquire_and_advance()
+                        cute.copy(
+                            tma_atom_k,
+                            tKgK[None, kv_coord],
+                            tKsK[None, k_handle.index],
+                            tma_bar_ptr=k_handle.barrier,
+                        )
                         v_handle = load_kv_producer.acquire_and_advance()
                         cute.copy(
                             tma_atom_v,
@@ -1294,30 +1309,9 @@ class BlackwellFusedMultiHeadAttentionForward:
                             tVsV[None, v_handle.index],
                             tma_bar_ptr=v_handle.barrier,
                         )
-                    kv_coord += 1
+                        kv_coord += 1
 
-                    seqlen_kv_loop_steps = (
-                        fmha_utils.FusedMask.get_trip_count(
-                            self.mask_type,
-                            curr_block_coord,
-                            self.cta_tiler,
-                            seqlen_q,
-                            seqlen_k,
-                            window_size_left,
-                            window_size_right,
-                        )
-                        - 1
-                    )
-                    for i in cutlass.range(0, seqlen_kv_loop_steps, 1, unroll=1):
-                        for d_chunk_idx in cutlass.range_constexpr(
-                            self.num_d_chunks
-                        ):
-                            tQgQ = tQgQ_qdl[
-                                None, None, d_chunk_idx, curr_block_coord_q[2]
-                            ]
-                            tKgK = tKgK_kdl[
-                                None, None, d_chunk_idx, curr_block_coord_kv[2]
-                            ]
+                        for i in cutlass.range(0, seqlen_kv_loop_steps, 1, unroll=1):
                             k_handle = load_kv_producer.acquire_and_advance()
                             cute.copy(
                                 tma_atom_k,
@@ -1325,26 +1319,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                                 tKsK[None, k_handle.index],
                                 tma_bar_ptr=k_handle.barrier,
                             )
-                            q0_handle = load_q_producer.acquire_and_advance()
-                            cute.copy(
-                                tma_atom_q,
-                                tQgQ[None, q0_coord],
-                                tQsQ[None, q0_handle.index],
-                                tma_bar_ptr=q0_handle.barrier,
-                            )
-                            q1_handle = load_q_producer.acquire_and_advance()
-                            cute.copy(
-                                tma_atom_q,
-                                tQgQ[None, q1_coord],
-                                tQsQ[None, q1_handle.index],
-                                tma_bar_ptr=q1_handle.barrier,
-                            )
-                        for d_chunk_idx in cutlass.range_constexpr(
-                            self.num_d_chunks
-                        ):
-                            tVgV = tVgV_dkl[
-                                None, d_chunk_idx, None, curr_block_coord_kv[2]
-                            ]
                             v_handle = load_kv_producer.acquire_and_advance()
                             cute.copy(
                                 tma_atom_v,
@@ -1352,7 +1326,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                                 tVsV[None, v_handle.index],
                                 tma_bar_ptr=v_handle.barrier,
                             )
-                        kv_coord += 1
+                            kv_coord += 1
                     # End of seqlen_kv loop
 
                 tile_sched.advance_to_next_work()
@@ -1394,14 +1368,26 @@ class BlackwellFusedMultiHeadAttentionForward:
                         cuseqlen_k = cum_seqlen_k[batch_coord]
                         seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
 
-                    # GEMM_QK0*K0 -> S0/S1 (all D chunks), then GEMM_PV00 per chunk
-                    s0_handle = mma_s0_producer.acquire_and_advance()
-                    s1_handle = mma_s1_producer.acquire_and_advance()
+                    seqlen_kv_loop_steps = (
+                        fmha_utils.FusedMask.get_trip_count(
+                            self.mask_type,
+                            curr_block_coord,
+                            self.cta_tiler,
+                            seqlen_q,
+                            seqlen_k,
+                            window_size_left,
+                            window_size_right,
+                        )
+                        - 1
+                    )
+
+                    # P1: full KV pass per D-chunk; Q0/Q1 smem held for entire pass (upstream).
                     for d_chunk_idx in cutlass.range_constexpr(self.num_d_chunks):
                         q0_handle = load_q_consumer.wait_and_advance()
                         tSrQ0 = tSrQ[None, None, None, q0_handle.index]
                         k_handle = load_kv_consumer.wait_and_advance()
                         tSrK0 = tSrK[None, None, None, k_handle.index]
+                        s0_handle = mma_s0_producer.acquire_and_advance()
                         num_kphases = cute.size(tSrQ0, mode=[2])
                         for kphase_idx in cutlass.range(
                             num_kphases, unroll_full=True
@@ -1418,8 +1404,11 @@ class BlackwellFusedMultiHeadAttentionForward:
                                 tSrK0[kphase_coord],
                                 tStS0,
                             )
+                        s0_handle.commit()
+
                         q1_handle = load_q_consumer.wait_and_advance()
                         tSrQ1 = tSrQ[None, None, None, q1_handle.index]
+                        s1_handle = mma_s1_producer.acquire_and_advance()
                         num_kphases = cute.size(tSrQ1, mode=[2])
                         for kphase_idx in cutlass.range(
                             num_kphases, unroll_full=True
@@ -1436,14 +1425,9 @@ class BlackwellFusedMultiHeadAttentionForward:
                                 tSrK0[kphase_coord],
                                 tStS1,
                             )
-                        # P1: release Q/K pipeline slots before next d_chunk (q_stage=2).
-                        q0_handle.release()
-                        q1_handle.release()
+                        s1_handle.commit()
                         k_handle.release()
-                    s0_handle.commit()
-                    s1_handle.commit()
 
-                    for d_chunk_idx in cutlass.range_constexpr(self.num_d_chunks):
                         v_handle = load_kv_consumer.wait_and_advance()
                         tOrVi = tOrV[None, None, None, v_handle.index]
                         o0_handle = mma_corr_producer.acquire_and_advance()
@@ -1465,34 +1449,11 @@ class BlackwellFusedMultiHeadAttentionForward:
                                 tOtO0,
                             )
                         o0_handle.commit()
-                        v_handle.release()
 
-                    seqlen_kv_loop_steps = (
-                        fmha_utils.FusedMask.get_trip_count(
-                            self.mask_type,
-                            curr_block_coord,
-                            self.cta_tiler,
-                            seqlen_q,
-                            seqlen_k,
-                            window_size_left,
-                            window_size_right,
-                        )
-                        - 1
-                    )
-
-                    pv_whether_acc = False
-                    for i in cutlass.range(0, seqlen_kv_loop_steps, 1, unroll=1):
-                        s0_handle = mma_s0_producer.acquire_and_advance()
-                        o1_handle = mma_corr_producer.acquire_and_advance()
-                        s1_handle = mma_s1_producer.acquire_and_advance()
-                        # P1: per d_chunk — QK (K,Q0,Q1) then PV (V), release pipeline slots each chunk.
-                        for d_chunk_idx in cutlass.range_constexpr(
-                            self.num_d_chunks
-                        ):
+                        pv_whether_acc = False
+                        for i in cutlass.range(0, seqlen_kv_loop_steps, 1, unroll=1):
                             k_handle = load_kv_consumer.wait_and_advance()
                             tSrKi = tSrK[None, None, None, k_handle.index]
-                            q0_handle = load_q_consumer.wait_and_advance()
-                            tSrQ0 = tSrQ[None, None, None, q0_handle.index]
                             inner_num_kphases = cute.size(tSrQ0, mode=[2])
                             for kphase_idx in cutlass.range(
                                 inner_num_kphases, unroll_full=True
@@ -1509,30 +1470,11 @@ class BlackwellFusedMultiHeadAttentionForward:
                                     tSrKi[kphase_coord],
                                     tStS0,
                                 )
-                            q1_handle = load_q_consumer.wait_and_advance()
-                            tSrQ1 = tSrQ[None, None, None, q1_handle.index]
-                            inner_num_kphases = cute.size(tSrQ1, mode=[2])
-                            for kphase_idx in cutlass.range(
-                                inner_num_kphases, unroll_full=True
-                            ):
-                                kphase_coord = (None, None, kphase_idx)
-                                qk_tiled_mma.set(
-                                    tcgen05.Field.ACCUMULATE,
-                                    d_chunk_idx != 0 or kphase_idx != 0,
-                                )
-                                cute.gemm(
-                                    qk_tiled_mma,
-                                    tStS1,
-                                    tSrQ1[kphase_coord],
-                                    tSrKi[kphase_coord],
-                                    tStS1,
-                                )
-                            k_handle.release()
-                            q0_handle.release()
-                            q1_handle.release()
+                            s0_handle = mma_s0_producer.acquire_and_advance()
+                            s0_handle.commit()
 
-                            v_handle = load_kv_consumer.wait_and_advance()
-                            tOrVi = tOrV[None, None, None, v_handle.index]
+                            o1_handle = mma_corr_producer.acquire_and_advance()
+                            s1_handle = mma_s1_producer.acquire_and_advance()
                             inner_num_kphases = cute.size(tOrP0, mode=[2])
                             for kphase_idx in cutlass.range(
                                 inner_num_kphases, unroll_full=True
@@ -1552,15 +1494,40 @@ class BlackwellFusedMultiHeadAttentionForward:
                                     tOtO1,
                                 )
                                 pv_whether_acc = True
+                            o1_handle.commit()
+                            v_handle.release()
+
+                            inner_num_kphases = cute.size(tSrQ1, mode=[2])
+                            for kphase_idx in cutlass.range(
+                                inner_num_kphases, unroll_full=True
+                            ):
+                                kphase_coord = (None, None, kphase_idx)
+                                qk_tiled_mma.set(
+                                    tcgen05.Field.ACCUMULATE,
+                                    d_chunk_idx != 0 or kphase_idx != 0,
+                                )
+                                cute.gemm(
+                                    qk_tiled_mma,
+                                    tStS1,
+                                    tSrQ1[kphase_coord],
+                                    tSrKi[kphase_coord],
+                                    tStS1,
+                                )
+                            s1_handle = mma_s1_producer.acquire_and_advance()
+                            s1_handle.commit()
+                            k_handle.release()
+
+                            v_handle = load_kv_consumer.wait_and_advance()
+                            tOrVi = tOrV[None, None, None, v_handle.index]
                             o0_handle = mma_corr_producer.acquire_and_advance()
                             s0_handle = mma_s0_producer.acquire_and_advance()
+                            inner_num_kphases = cute.size(tOrP0, mode=[2])
                             for kphase_idx in cutlass.range(
                                 inner_num_kphases, unroll_full=True
                             ):
                                 kphase_coord = (None, None, kphase_idx)
                                 pv_tiled_mma.set(
-                                    tcgen05.Field.ACCUMULATE,
-                                    d_chunk_idx != 0 or kphase_idx != 0,
+                                    tcgen05.Field.ACCUMULATE, True
                                 )
                                 cute.gemm(
                                     pv_tiled_mma,
@@ -1570,10 +1537,34 @@ class BlackwellFusedMultiHeadAttentionForward:
                                     tOtO0,
                                 )
                             o0_handle.commit()
-                            v_handle.release()
-                        s0_handle.commit()
+
+                        q0_handle.release()
+                        q1_handle.release()
+
+                        o1_handle = mma_corr_producer.acquire_and_advance()
+                        s1_handle = mma_s1_producer.acquire_and_advance()
+                        num_kphases = cute.size(tOrP1, mode=[2])
+                        for kphase_idx in cutlass.range(
+                            num_kphases, unroll_full=True
+                        ):
+                            kphase_coord = (None, None, kphase_idx)
+                            pv_tiled_mma.set(
+                                tcgen05.Field.ACCUMULATE,
+                                pv_whether_acc or d_chunk_idx != 0 or kphase_idx != 0,
+                            )
+                            cute.gemm(
+                                pv_tiled_mma,
+                                tOtO1,
+                                tOrP1[kphase_coord],
+                                tOrVi[kphase_coord],
+                                tOtO1,
+                            )
+                            pv_whether_acc = True
                         o1_handle.commit()
-                        s1_handle.commit()
+                        v_handle.release()
+
+                    s0_handle.commit()
+                    s1_handle.commit()
 
                 # Advance to next tile
                 tile_sched.advance_to_next_work()

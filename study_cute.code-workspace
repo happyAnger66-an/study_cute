@@ -7,13 +7,16 @@
 			"path": "../../sources/e2e/cutlass"
 		},
 		{
-			"path": "../../sources/opensrc/TensorRT-Edge-LLM"
-		},
-		{
-			"path": "../../sources/e2e/TensorRT-LLM"
-		},
-		{
 			"path": "../cutlass"
+		},
+		{
+			"path": "../TensorRT-Edge-LLM"
+		},
+		{
+			"path": "../openpi"
+		},
+		{
+			"path": "../TensorRT-LLM"
 		}
 	],
 	"settings": {}

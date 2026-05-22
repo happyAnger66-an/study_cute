@@ -1,7 +1,11 @@
 # FMHA 重构 + D=256 死锁修复 — 进度快照
 
-> 最后更新: 2026-05-22 (Friday) ~21:30 UTC+8
-> 状态: 重构完成 + Fix A 已落代码并通过编译回归; **待 Blackwell 真机验证运行时**
+> 最后更新: 2026-05-22 (Friday) ~22:30 UTC+8
+> 状态: **Fix A v2 重写**完成, D=128/D=256 都编译通过, 待 Blackwell 真机验证
+>
+> 重要更正: 第一版 Fix A 完全搞错了原版本的 V handle 模式, 导致 D=128 也死锁.
+> 第二版按原版本"acquire-defer-release"对偶模式扩展, 用 v_carry_list 在 PV 段间
+> 传递 (v_handle, tOrVi) 元组, 同时修复 D=256 计算错误.
 
 ---
 

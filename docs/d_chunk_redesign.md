@@ -1,7 +1,20 @@
 # FMHA D>128 (D-chunking) 重设计方案
 
-> 状态: **当前实现 broken, 已在 host config 里 reject D>128**
-> 目标: 记录完整诊断 + 给出 per-d_chunk pipeline 重构方案, 作为 future work
+> 状态: **outer-loop 设计已实施** (2026-05-22), 待 Blackwell 真机验证。
+>   - host config 不再 reject D>128
+>   - 5 个 warp (LOAD / MMA / softmax / correction / epilogue) 全部加外层
+>     `for d_chunk_outer in range(num_d_chunks)` loop
+>   - PV 段退化为 D=128 单 V 模式 (不再 inner d_chunk loop)
+>   - QK 段保留 inner d_chunk loop (S 必须跨完整 d 累加)
+>   - num_d_chunks=1 时 const_expr loop 单次, 完全等价 v3 D=128 path
+>
+> 历史 (有问题的) 设计:
+>   - PV inner d_chunk loop + `v_carry_list`: PV 跨 chunk 累加到同一 tOtO0 →
+>     d 维度被 reduce; epilogue 复制同一份 sO 到全部 gO slice → 输出错误
+>   - per-d_chunk PV+correction+epilogue (内层 pipeline) 方案: TMEM 不够装
+>     num_d_chunks 个 partial O (1-CTA SM100 TMEM 512 cols, 需 768 cols)
+>
+> 本文档下文保留原诊断和被否决方案的细节, 帮助理解为什么选 outer-loop。
 
 ---
 
@@ -116,7 +129,21 @@ correction warp 也只 fill 了一次 sO (对单个 tOtO0 / tOtO1),因此 epilog
 
 ---
 
-## 4. 重设计方案: per-d_chunk PV→correction→epilogue pipeline
+## 4. (被否决) 备选方案: per-d_chunk PV→correction→epilogue (inner-loop)
+
+**先评估的方案**: 把 PV / correction / epilogue 改成 d_chunk inner loop,
+每个 d_chunk 串行跑 PV→correction→epilogue, partial O 存 TMEM。
+
+**否决原因**: 这个方案需要 tOtO0 / tOtO1 各自能 hold 一个 d_chunk 的 partial O,
+跨 KV iter 累加 partial O。对 num_d_chunks=2, 需要 O0/O1 各 256 cols, 加 S0/S1
+各 128 cols, 总 768 cols, **超 1-CTA SM100 TMEM 512 cols 上限**。
+
+cutlass MLA (D_latent=512) 在 2-CTA mode 下能解决这个问题 (ThreadShape=(2,1,1),
+TMEM 容量翻倍), 但本项目是 1-CTA 设计, 不能直接套用。
+
+下文 §4.1 / §4.2 是被否决方案的细节,**仅作记录**。实际实施的方案见 §5。
+
+## 4-old (被否决) 重设计方案: per-d_chunk PV→correction→epilogue pipeline
 
 ### 4.1 流程对比
 
@@ -206,17 +233,49 @@ LOAD 端 `cute.copy(tma_atom_v, tVgV[..., d_chunk], tVsV[v_handle.index])` 已�
 
 ---
 
-## 5. 工作量估算
+## 5. (已实施) outer-loop 方案: d_chunk 外层循环
 
-| 模块 | 改动量 | 难点 |
-|---|---|---|
-| `mma_warp_body` | ~80 行 | acquire/commit 重排, ACCUMULATE 标志重算 |
-| `correction_warp_body` | ~50 行 | rescale 与 epilog 拆分, scale 缓存 |
-| `epilogue_warp_body` | ~60 行 | TMA partition 移入 d_chunk loop |
-| `_pick_pipeline_stages` | ~10 行 | acc_stage / epi_stage 倍增 |
-| 测试 / 调试 | 不可估 | 多 warp pipeline 联动易死锁/数据竞争 |
+### 5.1 核心思路
 
-预计 **1-2 天**集中工作 (含 trace debug)。
+不再尝试在 inner pipeline 解决 D-chunking, 而是**把整个 attention pipeline
+跑 num_d_chunks 次**, 每次只用一个 V[d_chunk_outer] 切片, 写到对应的
+gO[d_chunk_outer] slice:
+
+```
+for d_chunk_outer in range(num_d_chunks):
+    # 完整 attention pipeline (Q full, K full, V[d_chunk_outer], O[d_chunk_outer])
+    for kv_iter:
+        QK:  for d_chunk_inner: gemm S 累加 (S 取决于完整 d, 必须跨 inner 累加)
+        softmax(S) → P
+        PV:  gemm O = P @ V[d_chunk_outer]  # 单 V, 退化为 D=128 模式
+        correction (rescale)
+    final correction → sO
+    epilogue: TMA store sO → gO[d_chunk_outer]
+```
+
+**性能代价**: QK 和 softmax 在 D=256 时被算 2 次 (每个 d_chunk_outer 一次),
+PV 不重复。总 latency ~1.5x (vs in-place D=128 设计)。D=128 时
+`num_d_chunks=1`, outer loop 单次, 性能完全不变。
+
+**TMEM 用量**: 每个 d_chunk_outer iter 用同一份 tOtO0/tOtO1 (128 cols each),
+512 cols TMEM 容量足够, 不用 2-CTA。
+
+### 5.2 各 warp 改动
+
+| Warp | 改动 |
+|---|---|
+| LOAD | 外层 d_chunk_outer loop; 每个 outer iter 每 kv tile 产 num_d_chunks Q0+K+Q1 + **1 V[d_chunk_outer]** (不再 produce num_d_chunks V) |
+| MMA | 外层 d_chunk_outer loop 包整个 prologue+main+tail; **PV 段去掉 inner d_chunk loop** (单 V), `v_carry_list` 退化为单变量 `v_handle`/`tOrVi` |
+| softmax | 外层 d_chunk_outer loop 包整个 leading+unmask+trailing+final; 每个 outer iter 重置 (row_max, row_sum) |
+| correction | 外层 d_chunk_outer loop 包 KV correction loop + final epilog; final epilog 写 sO 给 epilogue |
+| epilogue | 外层 d_chunk_outer loop; 每个 iter wait 一对 corr_epi handles, TMA store `sO → gO[..., d_chunk_outer, ...]` |
+
+`fmha/host/config.py` 移除 D>128 reject, pipeline stage 数不变
+(q_stage=2, kv_stage=3, epi_stage=2, acc_stage=1)。
+
+### 5.3 工作量
+
+实际改动: ~250 行, 一次性完成 (2026-05-22)。
 
 ---
 

@@ -72,50 +72,34 @@ def epilogue_warp_body(
             gO_qdl = cute.flat_divide(
                 mO_qdl_, cute.select(self.pv_mma_tiler, mode=[0, 1])
             )
-            gO = gO_qdl[None, None, None, 0, curr_block_coord_o[2]]
-            tOsO, tOgO = cute.nvgpu.cpasync.tma_partition(
-                tma_atom_o,
-                0,
-                cute.make_layout(1),
-                cute.group_modes(sO, 0, 2),
-                cute.group_modes(gO, 0, 2),
-            )
-            o0_handle = corr_epi_consumer.wait_and_advance()
-            cute.copy(tma_atom_o, tOsO[None, 0], tOgO[None, o0_coord])
-            cute.arch.cp_async_bulk_commit_group()
-            o1_handle = corr_epi_consumer.wait_and_advance()
-            cute.copy(tma_atom_o, tOsO[None, 1], tOgO[None, o1_coord])
-            cute.arch.cp_async_bulk_commit_group()
-            cute.arch.cp_async_bulk_wait_group(1, read=True)
-            o0_handle.release()
-            cute.arch.cp_async_bulk_wait_group(0, read=True)
-            o1_handle.release()
 
-            # For D > 128, store the remaining D-chunks (sO buffer is shared,
-            # only the global stride changes per chunk).
-            if cutlass.const_expr(self.num_d_chunks > 1):
-                for d_chunk_idx in cutlass.range_constexpr(
-                    self.num_d_chunks - 1
-                ):
-                    d_idx = d_chunk_idx + 1
-                    gO = gO_qdl[None, None, None, d_idx, curr_block_coord_o[2]]
-                    _, tOgO = cute.nvgpu.cpasync.tma_partition(
-                        tma_atom_o,
-                        0,
-                        cute.make_layout(1),
-                        cute.group_modes(sO, 0, 2),
-                        cute.group_modes(gO, 0, 2),
-                    )
-                    cute.copy(
-                        tma_atom_o, tOsO[None, 0], tOgO[None, o0_coord]
-                    )
-                    cute.arch.cp_async_bulk_commit_group()
-                    cute.copy(
-                        tma_atom_o, tOsO[None, 1], tOgO[None, o1_coord]
-                    )
-                    cute.arch.cp_async_bulk_commit_group()
-                    cute.arch.cp_async_bulk_wait_group(1, read=True)
-                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+            # D-chunking outer loop: store the per-d_chunk sO produced by
+            # the correction warp to gO[..., d_chunk_outer, ...]. Each
+            # iteration consumes ONE pair of corr_epi handles (o0, o1)
+            # that the correction warp just committed. For D<=128
+            # (num_d_chunks=1) this is a single iteration -> identical to
+            # the legacy single-chunk path.
+            for d_chunk_outer in cutlass.range_constexpr(self.num_d_chunks):
+                gO = gO_qdl[
+                    None, None, None, d_chunk_outer, curr_block_coord_o[2]
+                ]
+                tOsO, tOgO = cute.nvgpu.cpasync.tma_partition(
+                    tma_atom_o,
+                    0,
+                    cute.make_layout(1),
+                    cute.group_modes(sO, 0, 2),
+                    cute.group_modes(gO, 0, 2),
+                )
+                o0_handle = corr_epi_consumer.wait_and_advance()
+                cute.copy(tma_atom_o, tOsO[None, 0], tOgO[None, o0_coord])
+                cute.arch.cp_async_bulk_commit_group()
+                o1_handle = corr_epi_consumer.wait_and_advance()
+                cute.copy(tma_atom_o, tOsO[None, 1], tOgO[None, o1_coord])
+                cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(1, read=True)
+                o0_handle.release()
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
+                o1_handle.release()
 
         tile_sched.advance_to_next_work()
         work_tile = tile_sched.get_current_work()

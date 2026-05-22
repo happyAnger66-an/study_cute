@@ -1,25 +1,35 @@
 # FMHA 重构 + D=256 死锁修复 — 进度快照
 
-> 最后更新: 2026-05-22 (Friday) ~23:05 UTC+8
+> 最后更新: 2026-05-22 (Friday) ~23:55 UTC+8
 > 状态:
 >   - **D=128**: 完全通过 (v3 修复 deadlock + 精度, prefill 3 轮 PASS, max_diff=0.0006)
->   - **D>128**: 已在 host config 里 **reject**, 因为 D-chunking 设计层面 broken
->     (详见 `docs/d_chunk_redesign.md`)
+>   - **D>128 (含 D=256)**: 已切换到 **d_chunk 外层 loop** 设计 ("outer-loop"),
+>     待 Blackwell 真机验证。设计细节见 `docs/d_chunk_redesign.md`。
 >
-> 修复历史 (主循环 4 段):
+> D-chunking 设计演进:
+>   - 原设计 (broken): PV inner d_chunk loop, 把多 chunk V 累加到同一个 tOtO0 →
+>     d 维度被错误 reduce; epilogue 把同一份 sO copy 到所有 gO slice
+>   - 备选: per-d_chunk PV+correction+epilogue (内层 d_chunk pipeline) →
+>     **TMEM 不够** (1-CTA SM100 只 512 cols, num_d_chunks=2 partial O 需 256 cols
+>     each × 2 = 512 cols, 加 S0/S1 = 768 cols, 超!)
+>   - 新设计 (outer-loop, 已实施): d_chunk_outer 外层 loop 包整个 attention pipeline,
+>     **QK 段保持 d_chunk_inner 累加 S** (S 必须跨完整 d), **PV 段退化为 D=128 单 V
+>     模式** (只用 V[d_chunk_outer], 不累加跨 chunk 的 partial O), correction/epilogue
+>     按 d_chunk_outer 写 sO + gO[d_chunk_outer]。TMEM 用量保持 512 cols 内。
+>   - 性能代价: QK 和 softmax 重复算 num_d_chunks 次 (D=256 ~1.5x latency,
+>     D=128 完全不变)。
+>
+> 修复历史 (D=128 主循环 4 段):
 >   - v1: 错把 PV1 也 wait V → D=128 死锁 (废弃)
 >   - v2: 用 `v_carry_list` 对 V handle "acquire-defer-release" → 死锁消除, 但
 >         **合并了 QK0i/QK1i 段**, 让 `s1_handle` 在 PV1 段提前 commit, QK1i 写 S1
 >         时 ownership 不在 mma 手里, softmax 读到没写完的 S1 算出错的 P1 →
 >         D=128 精度爆掉 `max_diff=99.7` (废弃)
->   - v3 (当前): 严格按原版 4 段顺序 `QK0i → PV1(i-1) → QK1i → PV0i`, s0/s1 跨段
->         共享句柄, 修复 v2 的精度问题, 同时保留 v2 的 V-handle carry list 设计
->
-> D>128 设计 bug (Blackwell 真机诊断确认):
->   - PV gemm 把 num_d_chunks 个 V 累加到同一个 tOtO0 → d 维度被错误 reduce
->   - Epilogue 把同一份 sO copy 到 num_d_chunks 个 gO slice → 每个 d_chunk 输出相同
->   - 验证: `actual[i] == chunk_0_ref[i] + chunk_1_ref[i]` 逐元素精确成立
->   - 必须 per-d_chunk 跑 PV+correction+epilogue, 涉及 3 个 warp 重构, 工作量 1-2 天
+>   - v3 (D=128 path 仍保留): 严格按原版 4 段顺序 `QK0i → PV1(i-1) → QK1i → PV0i`,
+>         s0/s1 跨段共享句柄, 修复 v2 的精度问题
+>   - outer-loop (当前 D>128 path): 在 v3 基础上把整个 prologue+main+tail 包到
+>     d_chunk_outer 外层, **PV 段去掉 v_carry_list** (单 V 模式), 5 个 warp 全部
+>     按 d_chunk_outer 重复执行
 
 ---
 
@@ -131,33 +141,44 @@ Tail PV1:      # NO wait! Use tOrVi from outer scope (= V_{N-1})
 每个 V handle 精确 1 acquire (在 PV0/PV00) + 1 release (在紧跟着的下一个
 PV1/tail PV1). 零泄漏, 完美 1-1 配对.
 
-**D-chunking (D=256) 扩展**: 每个 PV 段需要遍历 `num_d_chunks` 个 V handle
-(不同 D 维数据). 用 Python list `v_carry_list = [(v_handle, tOrVi), ...]`
-把整组传给下一个 PV 段. PV1 段用 `v_carry_list[d_chunk_idx]` 取对应 d_chunk
-的 tOrVi 做 gemm (这同时修复了 D=256 计算错误 — 否则只用 outer-scope 单个
-tOrVi 等于丢失了非最后 d_chunk 的 V 数据), 然后释放所有 handle.
+**D-chunking (D=256) 扩展**: 历史上 v2/v3 给 PV 段加了 inner d_chunk loop +
+`v_carry_list`, 试图让 PV 跨 d_chunk 累加 partial O。**但 TMEM 装不下** (见上),
+而且 epilogue 把同一份 sO 复制到全部 d_chunk slice → 输出错误 (`actual ==
+sum_of_ref_chunks`, 每个 chunk 输出一样, 见 docs/d_chunk_redesign.md)。
 
-**代码变更**: `fmha/device/warp_mma.py` 主循环重写, prologue / tail 微调:
+**当前 D>128 设计 (outer-loop)**: PV 段已**退化为 D=128 单 V 模式** (`tOrVi` 来自
+outer scope, 无 inner d_chunk loop, 无 `v_carry_list`)。整个 attention pipeline
+被外层 `for d_chunk_outer in range(num_d_chunks)` 包起来, 每次跑完整 attention
+但**只用 V[d_chunk_outer]**, 写 `gO[..., d_chunk_outer, ...]`。QK 段保留 inner
+d_chunk loop (因为 S 必须跨完整 d 维度累加)。
 
-Prologue (不变):
-- 合并 QK00 + QK10 跨 d_chunk, acquire s0/s1 → gemm S0/S1 → commit s0/s1
-- PV00: acquire o0 + new s0, `v_carry_list` 暂存 `num_d_chunks` 个
-  `(v_handle, tOrVi)`, defer 全部 V release, **不** commit s0 (留给 iter 0 QK0i)
+**代码变更 (D=128 v3 / D>128 outer-loop, 共用同一份代码 — num_d_chunks=1 时
+退化到 v3 path)**: `fmha/device/warp_mma.py` 主循环结构:
 
-Main loop 4 段:
-- **QK0i**: per d_chunk wait Q0 + K (push 到 `q0_handles` / `k_handles` list),
-  gemm S0 跨 d_chunk 累加, 末尾 `s0_handle.commit()`
-- **PV1(i-1)**: acquire o1 + new s1 (这个 s1 也会给 QK1i 用!), 遍历
-  `v_carry_list` 用对应 tOrVi gemm O1, commit o1, release `v_carry_list` 全部
-  V handle, **不** commit s1
-- **QK1i**: per d_chunk wait Q1, 用 `k_handles[d_chunk]` 里的 K, gemm S1 跨
-  d_chunk 累加, 末尾 `s1_handle.commit()` + 统一释放 Q0/Q1/K
-- **PV0i**: acquire o0 + new s0, 重新初始化 `v_carry_list = []`, 遍历 acquire
-  新一轮 V handle gemm O0, commit o0, **不** commit s0 (留给下个 iter QK0i)
+```
+for d_chunk_outer in range(num_d_chunks):    # const_expr, num_d_chunks=1 时单次
+    Prologue:
+        acquire s0/s1; for d_chunk_inner: gemm S0/S1 (累加跨 inner); commit s0/s1
+        PV00: acquire o0 + new s0, wait 1 V (V[d_chunk_outer]), gemm O0
+              (ACC = kphase!=0), commit o0, defer V release
+    Main loop iter i:
+        QK0i: per d_chunk_inner wait Q0+K (stash list), gemm S0 累加, commit s0
+        PV1(i-1): acquire o1 + new s1, gemm O1 with tOrVi (V_{i-1}),
+                  commit o1, release V_{i-1}
+        QK1i: per d_chunk_inner wait Q1, 用 stash 的 K, gemm S1 累加, commit s1,
+              统一释放 Q0/Q1/K
+        PV0i: acquire o0 + new s0, wait 1 V (V_i), gemm O0 (ACC=True),
+              commit o0, defer V release
+    Tail PV1:
+        acquire o1 + new s1, gemm O1 with V_{N-1}, commit o1, release V_{N-1},
+        commit s0 + commit s1 (清理)
+```
 
-Tail:
-- acquire o1 + new s1, 遍历 `v_carry_list` gemm O1, commit o1, release V 全部
-- **commit s0 + commit s1** (清理最后的 stage)
+LOAD 端镜像: 外层 d_chunk_outer loop, 每个 outer iter 每 kv tile 产 num_d_chunks
+个 Q0+K+Q1 + **1 个 V[d_chunk_outer]** (单 V)。
+
+correction / softmax / epilogue: 各自加外层 d_chunk_outer loop, 内层逻辑不变。
+correction final epilog 写 sO; epilogue 取 sO TMA store 到 gO[d_chunk_outer]。
 
 ### 关键时序约束
 
@@ -169,15 +190,17 @@ Tail:
    S1 (QK1i 段), 同一个 stage 复用 S1 buffer. PV1 提前 commit s1 (v2 bug)
    会让 QK1i 越权写, softmax 读到不一致的 S1.
 
-3. **D-chunked S0/S1/O0/O1 累加**: 跨 d_chunk 在同一个 stage 内累加 (因为
-   S0/S1 是 TMEM, O0/O1 是 TMEM 的不同 region), ACCUMULATE 标志按
-   `d_chunk!=0 or kphase!=0` 决定. PV1 段的 ACC 多 OR 一个 `pv_whether_acc`
-   覆盖 iter 0 第一次 PV1 的 "覆盖 O1" 行为.
+3. **D-chunked S0/S1 跨 inner d_chunk 累加**: 跨 d_chunk_inner 在同一个 S0/S1
+   stage 内累加 (S 取决于完整 d 维度), ACCUMULATE 标志按
+   `d_chunk_inner!=0 or kphase!=0` 决定. **PV 段不累加跨 chunk** — 每个
+   d_chunk_outer 跑完整 PV (V 只用一个 chunk), 写 sO + gO 各自不同 slice。
+   PV1 段的 ACC 用 `pv_whether_acc` 决定 (覆盖 iter 0 第一次 PV1)。
 
-4. **Python list 跨段流动 (v_carry_list / q0_handles / k_handles)**: 它们是
-   Python compile-time 对象 (`num_d_chunks` 是 const_expr, d_chunk 循环在
-   trace 时全部展开). list 中存的 `v_handle` / `tOrVi` / `k_handle` 是 DSL
-   值引用, 跨段流动符合 DSL 的 SSA 风格.
+4. **Python list 跨段流动 (q0_handles / k_handles)**: QK 段跨 d_chunk_inner 用
+   Python list 存 `q0_handle` / `k_handle` 跨 QK0i / QK1i 段 (因为 K 在 QK0i
+   和 QK1i 都要用)。Python list 是 compile-time 对象, list 中的 DSL 引用按 SSA
+   流动。**`v_carry_list` 已移除** (v3 path 也不再需要, num_d_chunks=1 时
+   carry list 退化为单元素, 直接用 `v_handle` 单变量等价)。
 
 ---
 
@@ -193,39 +216,39 @@ rm -rf fmha/__pycache__ fmha/host/__pycache__ fmha/device/__pycache__
 python3 fmha/fmha.py --q_shape 1,256,8,128 --k_shape 1,256,8,128 --is_persistent
 # 预期: 内置 3 轮 prefill ref check 全部 PASS, max_diff < 0.1 (而非 v2 的 99.7)
 
-# ② D=256 单 KV tile (loop_steps=0, 走 PV00 + 尾声 PV1 final)
-python3 fmha/fmha.py --q_shape 1,128,8,256 --k_shape 1,128,8,256 \
-  --is_persistent --skip_ref_check
-# 预期: kernel 不再死锁, 正常返回 latency
-
-# ③ D=256 多 KV tile (loop_steps>0, 走完整 PV00 → 主循环 → 尾声)
-python3 fmha/fmha.py --q_shape 1,256,8,256 --k_shape 1,256,8,256 \
-  --is_persistent --skip_ref_check
-
-# ④ D=256 + reference check + 3 轮 prefill (默认就跑)
+# ② D=256 + reference check + 3 轮 prefill (现在期望 PASS)
 python3 fmha/fmha.py --q_shape 1,128,8,256 --k_shape 1,128,8,256 --is_persistent
 python3 fmha/fmha.py --q_shape 1,256,8,256 --k_shape 1,256,8,256 --is_persistent
 # 预期: 3 轮 prefill 全 PASS, max_diff < 0.1
+
+# ③ 如有需要, 单 KV tile / 多 KV tile + skip ref:
+python3 fmha/fmha.py --q_shape 1,128,8,256 --k_shape 1,128,8,256 \
+  --is_persistent --skip_ref_check
+python3 fmha/fmha.py --q_shape 1,256,8,256 --k_shape 1,256,8,256 \
+  --is_persistent --skip_ref_check
 ```
 
-### 如果还死锁
+### 如果死锁
 
 打开 trace 看 LOAD/MMA 在哪个 V slot 卡住:
 ```python
 # fmha/host/config.py:
 debug_pipeline = True
 ```
-然后重新编译运行, 看 stderr 上 `LOAD pro V chunk=X slot=Y` 和
-`MMA PV00 wait V chunk=X slot=Y` 序列在哪一步停下来. 大概率会暴露:
-- LOAD 在某个 V acquire 阻塞 → 消费侧 (MMA) 漏了 release
-- MMA 在某个 V wait_and_advance 阻塞 → 生产侧 (LOAD) 没追上
+然后看 stderr 上的 `LOAD prologue d_outer=X kv=...` 和 `MMA prologue
+d_outer=X trip=...` 序列在哪一步停下来。
 
 ### 如果 ref check FAIL
 
-`v_carry` 持有的 SMEM 槽位被 LOAD 提前覆盖了. 排查方向:
-1. 检查 `o_handle.commit()` 时序是否真的覆盖了所有 cute.gemm
-2. 检查 `kv_stage` 是否足够 (主循环 PV1 释放 v_carry 之前, LOAD 是否会
-   acquire 到同一个 slot)
+可以用 `FMHA_DEBUG_DCHUNK=1` 看每个 d_chunk_outer 的 actual vs ref:
+
+```bash
+FMHA_DEBUG_DCHUNK=1 FMHA_DEBUG_ROUNDS=1 python3 fmha/fmha.py \
+  --q_shape 1,128,8,256 --k_shape 1,128,8,256 --is_persistent
+```
+
+期望: 每个 d_chunk 的 actual 与 ref 相近 (max_diff < 0.1), 且不同 d_chunk 的
+actual 应该**不同** (验证 V[d_chunk_outer] 切片正确生效)。
 
 ---
 

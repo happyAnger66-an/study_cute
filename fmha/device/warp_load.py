@@ -171,57 +171,25 @@ def load_warp_body(
             )
 
             # ------------------------------------------------------------------
-            # KV outer / D-chunk inner: one softmax commit per KV step (P1).
-            # See docs/support_d256.md.
+            # D-chunking outer loop: for D>128 we run the full attention
+            # pipeline ``num_d_chunks`` times per kv tile, each iteration
+            # loading the same Q+K (across inner d_chunks, so QK can
+            # accumulate S over the full d) but only ONE V slice
+            # (``V[d_chunk_outer]``). MMA / correction / epilogue mirror
+            # this outer loop; PV degenerates to single-V mode.
+            # See docs/d_chunk_redesign.md.
+            #
+            # For D<=128 (num_d_chunks=1) this outer loop collapses to a
+            # single iteration -> identical to the legacy D=128 path.
             # ------------------------------------------------------------------
-            kv_coord = seqlen_kv_loop_start
-            # ----- prologue: load Q0/K/Q1 then V for the first KV tile -----
-            if cutlass.const_expr(self.debug_pipeline):
-                cute.printf("LOAD prologue kv=%d num_d_chunks=%d\n",
-                            kv_coord, self.num_d_chunks)
-            for d_chunk_idx in cutlass.range_constexpr(self.num_d_chunks):
-                tQgQ = tQgQ_qdl[None, None, d_chunk_idx, curr_block_coord_q[2]]
-                tKgK = tKgK_kdl[None, None, d_chunk_idx, curr_block_coord_kv[2]]
-                q0_handle = load_q_producer.acquire_and_advance()
-                cute.copy(
-                    tma_atom_q,
-                    tQgQ[None, q0_coord],
-                    tQsQ[None, q0_handle.index],
-                    tma_bar_ptr=q0_handle.barrier,
-                )
-                k_handle = load_kv_producer.acquire_and_advance()
+            for d_chunk_outer in cutlass.range_constexpr(self.num_d_chunks):
+                kv_coord = seqlen_kv_loop_start
+                # ----- prologue: load Q0/K/Q1 (all inner d_chunks)
+                # then V[d_chunk_outer] for the first KV tile -----
                 if cutlass.const_expr(self.debug_pipeline):
-                    cute.printf("LOAD pro K chunk=%d slot=%d\n",
-                                d_chunk_idx, k_handle.index)
-                cute.copy(
-                    tma_atom_k,
-                    tKgK[None, kv_coord],
-                    tKsK[None, k_handle.index],
-                    tma_bar_ptr=k_handle.barrier,
-                )
-                q1_handle = load_q_producer.acquire_and_advance()
-                cute.copy(
-                    tma_atom_q,
-                    tQgQ[None, q1_coord],
-                    tQsQ[None, q1_handle.index],
-                    tma_bar_ptr=q1_handle.barrier,
-                )
-            for d_chunk_idx in cutlass.range_constexpr(self.num_d_chunks):
-                tVgV = tVgV_dkl[None, d_chunk_idx, None, curr_block_coord_kv[2]]
-                v_handle = load_kv_producer.acquire_and_advance()
-                if cutlass.const_expr(self.debug_pipeline):
-                    cute.printf("LOAD pro V chunk=%d slot=%d\n",
-                                d_chunk_idx, v_handle.index)
-                cute.copy(
-                    tma_atom_v,
-                    tVgV[None, kv_coord],
-                    tVsV[None, v_handle.index],
-                    tma_bar_ptr=v_handle.barrier,
-                )
-            kv_coord += 1
-
-            # ----- inner loop: per remaining KV step, load Q0/K/Q1, V -----
-            for i in cutlass.range(0, seqlen_kv_loop_steps, 1, unroll=1):
+                    cute.printf(
+                        "LOAD prologue d_outer=%d kv=%d num_d_chunks=%d\n",
+                        d_chunk_outer, kv_coord, self.num_d_chunks)
                 for d_chunk_idx in cutlass.range_constexpr(self.num_d_chunks):
                     tQgQ = tQgQ_qdl[
                         None, None, d_chunk_idx, curr_block_coord_q[2]
@@ -250,9 +218,59 @@ def load_warp_body(
                         tQsQ[None, q1_handle.index],
                         tma_bar_ptr=q1_handle.barrier,
                     )
-                for d_chunk_idx in cutlass.range_constexpr(self.num_d_chunks):
+                # Produce a single V slice (V[d_chunk_outer]).
+                tVgV = tVgV_dkl[
+                    None, d_chunk_outer, None, curr_block_coord_kv[2]
+                ]
+                v_handle = load_kv_producer.acquire_and_advance()
+                if cutlass.const_expr(self.debug_pipeline):
+                    cute.printf(
+                        "LOAD pro V d_outer=%d slot=%d\n",
+                        d_chunk_outer, v_handle.index)
+                cute.copy(
+                    tma_atom_v,
+                    tVgV[None, kv_coord],
+                    tVsV[None, v_handle.index],
+                    tma_bar_ptr=v_handle.barrier,
+                )
+                kv_coord += 1
+
+                # ----- inner loop: per remaining KV step, same shape -----
+                for i in cutlass.range(
+                    0, seqlen_kv_loop_steps, 1, unroll=1
+                ):
+                    for d_chunk_idx in cutlass.range_constexpr(
+                        self.num_d_chunks
+                    ):
+                        tQgQ = tQgQ_qdl[
+                            None, None, d_chunk_idx, curr_block_coord_q[2]
+                        ]
+                        tKgK = tKgK_kdl[
+                            None, None, d_chunk_idx, curr_block_coord_kv[2]
+                        ]
+                        q0_handle = load_q_producer.acquire_and_advance()
+                        cute.copy(
+                            tma_atom_q,
+                            tQgQ[None, q0_coord],
+                            tQsQ[None, q0_handle.index],
+                            tma_bar_ptr=q0_handle.barrier,
+                        )
+                        k_handle = load_kv_producer.acquire_and_advance()
+                        cute.copy(
+                            tma_atom_k,
+                            tKgK[None, kv_coord],
+                            tKsK[None, k_handle.index],
+                            tma_bar_ptr=k_handle.barrier,
+                        )
+                        q1_handle = load_q_producer.acquire_and_advance()
+                        cute.copy(
+                            tma_atom_q,
+                            tQgQ[None, q1_coord],
+                            tQsQ[None, q1_handle.index],
+                            tma_bar_ptr=q1_handle.barrier,
+                        )
                     tVgV = tVgV_dkl[
-                        None, d_chunk_idx, None, curr_block_coord_kv[2]
+                        None, d_chunk_outer, None, curr_block_coord_kv[2]
                     ]
                     v_handle = load_kv_producer.acquire_and_advance()
                     cute.copy(
@@ -261,8 +279,8 @@ def load_warp_body(
                         tVsV[None, v_handle.index],
                         tma_bar_ptr=v_handle.barrier,
                     )
-                kv_coord += 1
-            # End of seqlen_kv loop
+                    kv_coord += 1
+                # End of seqlen_kv loop for this d_chunk_outer
 
         tile_sched.advance_to_next_work()
         work_tile = tile_sched.get_current_work()

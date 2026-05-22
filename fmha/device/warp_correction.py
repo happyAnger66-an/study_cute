@@ -118,10 +118,6 @@ def correction_warp_body(
             if cutlass.const_expr(cum_seqlen_k is not None):
                 cuseqlen_k = cum_seqlen_k[batch_coord]
                 seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
-            # Ignore first signal from softmax as no correction is required
-            vec0_handle = s0_corr_consumer.wait_and_advance()
-            vec0_handle.release()
-            vec1_handle = s1_corr_consumer.wait_and_advance()
 
             seqlen_kv_loop_steps = (
                 fmha_utils.FusedMask.get_trip_count(
@@ -135,95 +131,112 @@ def correction_warp_body(
                 )
                 - 1
             )
-            for i in cutlass.range(0, seqlen_kv_loop_steps, 1, unroll=1):
+
+            # D-chunking outer loop: the entire KV correction loop + final
+            # epilog runs ``num_d_chunks`` times per kv tile, mirroring the
+            # MMA / LOAD outer loop. Final correction_epilog writes
+            # ``sO[..., d_chunk_outer]`` for the epilogue warp to TMA-store
+            # to gO[..., d_chunk_outer, ...]. For D<=128 (num_d_chunks=1)
+            # this collapses to the legacy single-iteration path.
+            for d_chunk_outer in cutlass.range_constexpr(self.num_d_chunks):
+                # Ignore first signal from softmax (no correction needed
+                # for the prologue's first PV).
+                vec0_handle = s0_corr_consumer.wait_and_advance()
+                vec0_handle.release()
+                vec1_handle = s1_corr_consumer.wait_and_advance()
+
+                for i in cutlass.range(
+                    0, seqlen_kv_loop_steps, 1, unroll=1
+                ):
+                    vec0_handle = s0_corr_consumer.wait_and_advance()
+                    tTMEM_LOAD_VECrS = cute.make_rmem_tensor(
+                        tTMEM_LOAD_VECcS.shape, self.qk_acc_dtype
+                    )
+                    cute.copy(
+                        tiled_tmem_load_vec,
+                        tTMEM_LOAD_VECtS0,
+                        tTMEM_LOAD_VECrS,
+                    )
+                    scale_ = scale_softmax_log2 * (
+                        tTMEM_LOAD_VECrS[0] - tTMEM_LOAD_VECrS[1]
+                    )
+                    scale = cute.math.exp2(scale_, fastmath=True)
+                    o0_handle = mma_corr_consumer.wait_and_advance()
+                    self.correction_rescale(pv_thr_mma, tOtO0, scale)
+                    vec1_handle.release()
+                    cute.arch.fence_view_async_tmem_store()
+                    o0_handle.release()
+
+                    vec1_handle = s1_corr_consumer.wait_and_advance()
+                    cute.copy(
+                        tiled_tmem_load_vec,
+                        tTMEM_LOAD_VECtS1,
+                        tTMEM_LOAD_VECrS,
+                    )
+                    scale_ = scale_softmax_log2 * (
+                        tTMEM_LOAD_VECrS[0] - tTMEM_LOAD_VECrS[1]
+                    )
+                    scale = cute.math.exp2(scale_, fastmath=True)
+                    o1_handle = mma_corr_consumer.wait_and_advance()
+                    self.correction_rescale(pv_thr_mma, tOtO1, scale)
+                    vec0_handle.release()
+                    cute.arch.fence_view_async_tmem_store()
+                    o1_handle.release()
+                # End of seqlen_corr_loop_steps
+                vec1_handle.release()
+
                 vec0_handle = s0_corr_consumer.wait_and_advance()
                 tTMEM_LOAD_VECrS = cute.make_rmem_tensor(
                     tTMEM_LOAD_VECcS.shape, self.qk_acc_dtype
                 )
                 cute.copy(
-                    tiled_tmem_load_vec,
-                    tTMEM_LOAD_VECtS0,
-                    tTMEM_LOAD_VECrS,
+                    tiled_tmem_load_vec, tTMEM_LOAD_VECtS0, tTMEM_LOAD_VECrS
                 )
-                scale_ = scale_softmax_log2 * (
-                    tTMEM_LOAD_VECrS[0] - tTMEM_LOAD_VECrS[1]
-                )
-                scale = cute.math.exp2(scale_, fastmath=True)
+                cute.arch.fence_view_async_tmem_load()
+                vec0_handle.release()
                 o0_handle = mma_corr_consumer.wait_and_advance()
-                self.correction_rescale(pv_thr_mma, tOtO0, scale)
-                vec1_handle.release()
-                cute.arch.fence_view_async_tmem_store()
+                o0_final_handle = corr_epi_producer.acquire_and_advance()
+                self.correction_epilog(
+                    pv_thr_mma,
+                    tOtO0,
+                    mLSE,
+                    tTMEM_LOAD_VECrS,
+                    row_idx,
+                    cuseqlen_q,
+                    seqlen_q,
+                    curr_block_coord_lse,
+                    scale_softmax,
+                    scale_output / tTMEM_LOAD_VECrS[0],
+                    sO[None, None, 0],
+                )
                 o0_handle.release()
+                o0_final_handle.commit()
 
                 vec1_handle = s1_corr_consumer.wait_and_advance()
                 cute.copy(
-                    tiled_tmem_load_vec,
-                    tTMEM_LOAD_VECtS1,
-                    tTMEM_LOAD_VECrS,
+                    tiled_tmem_load_vec, tTMEM_LOAD_VECtS1, tTMEM_LOAD_VECrS
                 )
-                scale_ = scale_softmax_log2 * (
-                    tTMEM_LOAD_VECrS[0] - tTMEM_LOAD_VECrS[1]
-                )
-                scale = cute.math.exp2(scale_, fastmath=True)
+                cute.arch.fence_view_async_tmem_load()
+                vec1_handle.release()
                 o1_handle = mma_corr_consumer.wait_and_advance()
-                self.correction_rescale(pv_thr_mma, tOtO1, scale)
-                vec0_handle.release()
-                cute.arch.fence_view_async_tmem_store()
+                o1_final_handle = corr_epi_producer.acquire_and_advance()
+                row_idx_o1 = row_idx + self.qk_mma_tiler[0]
+                self.correction_epilog(
+                    pv_thr_mma,
+                    tOtO1,
+                    mLSE,
+                    tTMEM_LOAD_VECrS,
+                    row_idx_o1,
+                    cuseqlen_q,
+                    seqlen_q,
+                    curr_block_coord_lse,
+                    scale_softmax,
+                    scale_output / tTMEM_LOAD_VECrS[0],
+                    sO[None, None, 1],
+                )
                 o1_handle.release()
-            # End of seqlen_corr_loop_steps
-            vec1_handle.release()
-
-            vec0_handle = s0_corr_consumer.wait_and_advance()
-            tTMEM_LOAD_VECrS = cute.make_rmem_tensor(
-                tTMEM_LOAD_VECcS.shape, self.qk_acc_dtype
-            )
-            cute.copy(
-                tiled_tmem_load_vec, tTMEM_LOAD_VECtS0, tTMEM_LOAD_VECrS
-            )
-            cute.arch.fence_view_async_tmem_load()
-            vec0_handle.release()
-            o0_handle = mma_corr_consumer.wait_and_advance()
-            o0_final_handle = corr_epi_producer.acquire_and_advance()
-            self.correction_epilog(
-                pv_thr_mma,
-                tOtO0,
-                mLSE,
-                tTMEM_LOAD_VECrS,
-                row_idx,
-                cuseqlen_q,
-                seqlen_q,
-                curr_block_coord_lse,
-                scale_softmax,
-                scale_output / tTMEM_LOAD_VECrS[0],
-                sO[None, None, 0],
-            )
-            o0_handle.release()
-            o0_final_handle.commit()
-
-            vec1_handle = s1_corr_consumer.wait_and_advance()
-            cute.copy(
-                tiled_tmem_load_vec, tTMEM_LOAD_VECtS1, tTMEM_LOAD_VECrS
-            )
-            cute.arch.fence_view_async_tmem_load()
-            vec1_handle.release()
-            o1_handle = mma_corr_consumer.wait_and_advance()
-            o1_final_handle = corr_epi_producer.acquire_and_advance()
-            row_idx_o1 = row_idx + self.qk_mma_tiler[0]
-            self.correction_epilog(
-                pv_thr_mma,
-                tOtO1,
-                mLSE,
-                tTMEM_LOAD_VECrS,
-                row_idx_o1,
-                cuseqlen_q,
-                seqlen_q,
-                curr_block_coord_lse,
-                scale_softmax,
-                scale_output / tTMEM_LOAD_VECrS[0],
-                sO[None, None, 1],
-            )
-            o1_handle.release()
-            o1_final_handle.commit()
+                o1_final_handle.commit()
+            # End of d_chunk_outer loop
         # Advance to next tile
         tile_sched.advance_to_next_work()
         work_tile = tile_sched.get_current_work()

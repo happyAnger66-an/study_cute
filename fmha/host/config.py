@@ -213,27 +213,23 @@ class BlackwellFusedMultiHeadAttentionForward:
                 f"see study_cute/docs/support_d256.md"
             )
         if self.num_d_chunks > 1:
-            # D>128 path is currently broken at the design level (see
-            # docs/d_chunk_redesign.md):
-            #   1. PV gemm accumulates O across d_chunks into the same
-            #      tOtO0/tOtO1 region (reduces d, instead of concatenating)
-            #   2. Epilogue stores the same sO to every gO[d_chunk] slice
-            # Verified on Blackwell: actual == sum_over_d_chunks(ref_chunk),
-            # and chunk_0_actual == chunk_1_actual. Fixing requires a
-            # per-d_chunk PV+correction+epilogue pipeline (mma /
-            # correction / epilogue warps all need restructuring).
-            #
-            # Until that redesign lands, reject D>128 at compile time so
-            # users don't get silently-wrong results (or worse, deadlocks
-            # in later prefill rounds).
-            raise ValueError(
-                f"FMHA D>128 (head_dim={self.head_dim}, "
-                f"num_d_chunks={self.num_d_chunks}) is currently unsupported: "
-                f"the D-chunking pipeline accumulates PV across d_chunks "
-                f"and replicates the same sO to every gO d_chunk slice, "
-                f"producing wrong results. See "
-                f"study_cute/docs/d_chunk_redesign.md for the diagnosis "
-                f"and the required redesign."
+            # D>128 is implemented via an OUTER d_chunk loop in every
+            # warp: the full attention pipeline runs num_d_chunks times
+            # per kv tile, each iteration using a single V[d_chunk_outer]
+            # slice and writing to gO[..., d_chunk_outer, ...].
+            #   - QK still walks the inner d_chunk loop and accumulates S
+            #     across ALL d_chunks (S depends on the full d).
+            #   - PV degenerates to the D=128 single-V mode (no inner
+            #     d_chunk loop), so TMEM stays within 512 cols.
+            #   - Cost: QK / softmax are recomputed num_d_chunks times
+            #     (D=256 -> ~1.5x latency, D=128 unaffected).
+            # See docs/d_chunk_redesign.md for details.
+            print(
+                f"[fmha] D-chunking: head_dim={self.head_dim}, "
+                f"d_chunk_k={self.d_chunk_k}, "
+                f"num_d_chunks={self.num_d_chunks} (outer-loop mode), "
+                f"stages q={self.q_stage} kv={self.kv_stage} "
+                f"epi={self.epi_stage}, estimated staged SMEM={est} bytes"
             )
 
     def _setup_attributes(self):

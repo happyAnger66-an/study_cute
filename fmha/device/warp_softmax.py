@@ -318,8 +318,6 @@ def softmax(
             if cutlass.const_expr(cum_seqlen_k is not None):
                 cuseqlen_k = cum_seqlen_k[batch_coord]
                 seqlen_k_ = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
-            row_max = -Float32.inf
-            row_sum = 0.0
             value_args = (
                 seqlen_k_,
                 seqlen_q_,
@@ -348,7 +346,6 @@ def softmax(
                 0,
             )
             cS = cute.domain_offset(logical_offset, cS_base)
-            vec_i_handle = si_corr_producer.acquire_and_advance()
 
             start_count = fmha_utils.FusedMask.get_trip_start(
                 self.mask_type,
@@ -358,8 +355,6 @@ def softmax(
                 seqlen_k_,
                 window_size_left,
             )
-
-            # ---- masked-leading region: needs to apply mask each iter ----
             leading_mask_count = fmha_utils.FusedMask.get_masked_leading_count(
                 self.mask_type,
                 curr_block_coord,
@@ -369,36 +364,6 @@ def softmax(
                 window_size_left,
                 window_size_right,
             )
-            for i in cutlass.range(
-                start_count, start_count + leading_mask_count, 1, unroll=1
-            ):
-                cS_iter = cute.domain_offset((0, i * self.qk_mma_tiler[1]), cS)
-                iter_args = (cS_iter, row_max, row_sum, vec_i_handle)
-                pipeline_args = (
-                    mma_si_consumer,
-                    si_corr_producer,
-                    s0_s1_sequence_consumer,
-                    s0_s1_sequence_producer,
-                )
-                (
-                    row_max,
-                    row_sum,
-                    vec_i_handle,
-                    mma_si_consumer,
-                    si_corr_producer,
-                    s0_s1_sequence_consumer,
-                    s0_s1_sequence_producer,
-                ) = self.softmax_step(
-                    stage,
-                    True,
-                    iter_args,
-                    value_args,
-                    pipeline_args,
-                    atom_args,
-                    tensor_args,
-                )
-
-            # ---- unmasked region: hot loop, no mask call ----
             unmask_count = fmha_utils.FusedMask.get_unmasked_trip_count(
                 self.mask_type,
                 curr_block_coord,
@@ -408,39 +373,6 @@ def softmax(
                 window_size_left,
                 window_size_right,
             )
-            for i in cutlass.range(
-                start_count + leading_mask_count,
-                start_count + leading_mask_count + unmask_count,
-                1,
-                unroll=1,
-            ):
-                cS_iter = cute.domain_offset((0, i * self.qk_mma_tiler[1]), cS)
-                iter_args = (cS_iter, row_max, row_sum, vec_i_handle)
-                pipeline_args = (
-                    mma_si_consumer,
-                    si_corr_producer,
-                    s0_s1_sequence_consumer,
-                    s0_s1_sequence_producer,
-                )
-                (
-                    row_max,
-                    row_sum,
-                    vec_i_handle,
-                    mma_si_consumer,
-                    si_corr_producer,
-                    s0_s1_sequence_consumer,
-                    s0_s1_sequence_producer,
-                ) = self.softmax_step(
-                    stage,
-                    False,
-                    iter_args,
-                    value_args,
-                    pipeline_args,
-                    atom_args,
-                    tensor_args,
-                )
-
-            # ---- masked-trailing region ----
             trailing_mask_count = fmha_utils.FusedMask.get_masked_trailing_count(
                 self.mask_type,
                 curr_block_coord,
@@ -450,54 +382,138 @@ def softmax(
                 window_size_left,
                 window_size_right,
             )
-            for i in cutlass.range(
-                start_count + leading_mask_count + unmask_count,
-                start_count
-                + leading_mask_count
-                + unmask_count
-                + trailing_mask_count,
-                1,
-                unroll=1,
-            ):
-                cS_iter = cute.domain_offset((0, i * self.qk_mma_tiler[1]), cS)
-                iter_args = (cS_iter, row_max, row_sum, vec_i_handle)
-                pipeline_args = (
-                    mma_si_consumer,
-                    si_corr_producer,
-                    s0_s1_sequence_consumer,
-                    s0_s1_sequence_producer,
-                )
-                (
-                    row_max,
-                    row_sum,
-                    vec_i_handle,
-                    mma_si_consumer,
-                    si_corr_producer,
-                    s0_s1_sequence_consumer,
-                    s0_s1_sequence_producer,
-                ) = self.softmax_step(
-                    stage,
-                    True,
-                    iter_args,
-                    value_args,
-                    pipeline_args,
-                    atom_args,
-                    tensor_args,
-                )
 
-            # ---- final: dump (row_sum, row_max) to correction ----
-            si_handle = mma_si_consumer.wait_and_advance()
-            tTMEM_STORE_VECrS = cute.make_rmem_tensor(
-                tTMEM_STORE_VECcS.shape, self.qk_acc_dtype
-            )
-            tTMEM_STORE_VECrS[0] = row_sum
-            tTMEM_STORE_VECrS[1] = row_max
-            cute.copy(tiled_tmem_store_vec, tTMEM_STORE_VECrS, tTMEM_STORE_VECtS)
-            cute.arch.fence_view_async_tmem_store()
-            vec_i_handle.commit()
-            si_corr_producer.acquire()
-            # Empty step to sync against pipe s
-            si_handle.release()
+            # D-chunking outer loop: softmax mirrors MMA / correction --
+            # it runs the full leading + unmask + trailing KV loop
+            # ``num_d_chunks`` times per work_tile, each iteration
+            # resetting (row_max, row_sum) and acquiring a fresh
+            # vec_i_handle. For D<=128 (num_d_chunks=1) this is a single
+            # iteration -> identical to the legacy single-chunk path.
+            for d_chunk_outer in cutlass.range_constexpr(self.num_d_chunks):
+                row_max = -Float32.inf
+                row_sum = 0.0
+                vec_i_handle = si_corr_producer.acquire_and_advance()
+
+                # ---- masked-leading region ----
+                for i in cutlass.range(
+                    start_count, start_count + leading_mask_count, 1, unroll=1
+                ):
+                    cS_iter = cute.domain_offset(
+                        (0, i * self.qk_mma_tiler[1]), cS
+                    )
+                    iter_args = (cS_iter, row_max, row_sum, vec_i_handle)
+                    pipeline_args = (
+                        mma_si_consumer,
+                        si_corr_producer,
+                        s0_s1_sequence_consumer,
+                        s0_s1_sequence_producer,
+                    )
+                    (
+                        row_max,
+                        row_sum,
+                        vec_i_handle,
+                        mma_si_consumer,
+                        si_corr_producer,
+                        s0_s1_sequence_consumer,
+                        s0_s1_sequence_producer,
+                    ) = self.softmax_step(
+                        stage,
+                        True,
+                        iter_args,
+                        value_args,
+                        pipeline_args,
+                        atom_args,
+                        tensor_args,
+                    )
+
+                # ---- unmasked region ----
+                for i in cutlass.range(
+                    start_count + leading_mask_count,
+                    start_count + leading_mask_count + unmask_count,
+                    1,
+                    unroll=1,
+                ):
+                    cS_iter = cute.domain_offset(
+                        (0, i * self.qk_mma_tiler[1]), cS
+                    )
+                    iter_args = (cS_iter, row_max, row_sum, vec_i_handle)
+                    pipeline_args = (
+                        mma_si_consumer,
+                        si_corr_producer,
+                        s0_s1_sequence_consumer,
+                        s0_s1_sequence_producer,
+                    )
+                    (
+                        row_max,
+                        row_sum,
+                        vec_i_handle,
+                        mma_si_consumer,
+                        si_corr_producer,
+                        s0_s1_sequence_consumer,
+                        s0_s1_sequence_producer,
+                    ) = self.softmax_step(
+                        stage,
+                        False,
+                        iter_args,
+                        value_args,
+                        pipeline_args,
+                        atom_args,
+                        tensor_args,
+                    )
+
+                # ---- masked-trailing region ----
+                for i in cutlass.range(
+                    start_count + leading_mask_count + unmask_count,
+                    start_count
+                    + leading_mask_count
+                    + unmask_count
+                    + trailing_mask_count,
+                    1,
+                    unroll=1,
+                ):
+                    cS_iter = cute.domain_offset(
+                        (0, i * self.qk_mma_tiler[1]), cS
+                    )
+                    iter_args = (cS_iter, row_max, row_sum, vec_i_handle)
+                    pipeline_args = (
+                        mma_si_consumer,
+                        si_corr_producer,
+                        s0_s1_sequence_consumer,
+                        s0_s1_sequence_producer,
+                    )
+                    (
+                        row_max,
+                        row_sum,
+                        vec_i_handle,
+                        mma_si_consumer,
+                        si_corr_producer,
+                        s0_s1_sequence_consumer,
+                        s0_s1_sequence_producer,
+                    ) = self.softmax_step(
+                        stage,
+                        True,
+                        iter_args,
+                        value_args,
+                        pipeline_args,
+                        atom_args,
+                        tensor_args,
+                    )
+
+                # ---- final: dump (row_sum, row_max) to correction ----
+                si_handle = mma_si_consumer.wait_and_advance()
+                tTMEM_STORE_VECrS = cute.make_rmem_tensor(
+                    tTMEM_STORE_VECcS.shape, self.qk_acc_dtype
+                )
+                tTMEM_STORE_VECrS[0] = row_sum
+                tTMEM_STORE_VECrS[1] = row_max
+                cute.copy(
+                    tiled_tmem_store_vec, tTMEM_STORE_VECrS, tTMEM_STORE_VECtS
+                )
+                cute.arch.fence_view_async_tmem_store()
+                vec_i_handle.commit()
+                si_corr_producer.acquire()
+                si_handle.release()
+            # End of d_chunk_outer loop
 
         tile_sched.advance_to_next_work()
         work_tile = tile_sched.get_current_work()

@@ -160,13 +160,35 @@ def mma_warp_body(
             s1_handle.commit()
 
             # GEMM_PV00: P0 * V_prologue (first V tile, walking all D-chunks).
+            #
+            # D=256 FIX: balance V wait/release across the entire kernel.
+            # Legacy code releases ZERO PV00 V handles -> leaks num_d_chunks
+            # slots in the prologue alone, which exceeds kv_stage=3 for D=256
+            # (num_d_chunks=2) and causes LOAD to deadlock on acquire.
+            #
+            # Strategy (applied to PV00 / PV1(i-1) / PV0i / PV1 final, all 4):
+            #   - Gather every V handle in a Python list during the d_chunk
+            #     loop (lists are const_expr at trace time since num_d_chunks
+            #     is a compile-time constant).
+            #   - cute.gemm is async; we cannot release before the o_handle
+            #     commit (the commit is what guarantees tensor cores have
+            #     finished reading the V SMEM). So we release AFTER commit.
+            #   - For PV00 / PV0i: defer the LAST handle as `v_carry` because
+            #     `tOrVi` (a view into that slot) is reused by the NEXT PV
+            #     step (next iter's PV1, or the post-loop PV1 final).
+            #   - For PV1(i-1) / PV1 final: release ALL handles after commit.
+            #     PV1's tOrVi is not reused downstream within the iter.
+            #   - Each PV1(i-1) also releases the PREVIOUS v_carry FIRST,
+            #     which closes the carry chain across the kv loop.
             o0_handle = mma_corr_producer.acquire_and_advance()
             s0_handle = mma_s0_producer.acquire_and_advance()
+            v_handles_pv00 = []
             for d_chunk_idx in cutlass.range_constexpr(self.num_d_chunks):
                 v_handle = load_kv_consumer.wait_and_advance()
                 if cutlass.const_expr(self.debug_pipeline):
                     cute.printf("MMA PV00 wait V chunk=%d slot=%d\n",
                                 d_chunk_idx, v_handle.index)
+                v_handles_pv00.append(v_handle)
                 tOrVi = tOrV[None, None, None, v_handle.index]
                 num_kphases = cute.size(tOrP0, mode=[2])
                 for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
@@ -183,6 +205,11 @@ def mma_warp_body(
                         tOtO0,
                     )
             o0_handle.commit()
+            # Release all but the LAST PV00 V handle; carry the last one as
+            # `v_carry` for the first loop PV1 (or post-loop tail) to release.
+            for _i in cutlass.range_constexpr(self.num_d_chunks - 1):
+                v_handles_pv00[_i].release()
+            v_carry = v_handles_pv00[self.num_d_chunks - 1]
 
             # ============================================================
             # Main loop: per remaining KV step run QK0i, QK1i, PV1(i-1), PV0i
@@ -235,10 +262,19 @@ def mma_warp_body(
                 s0_handle.commit()
 
                 # --- GEMM_PV1(i-1): P1 @ V_{i-1}, per D-chunk ---
+                # D=256 FIX: release the carried V handle from the previous
+                # PV step (last iter's PV0i, or prologue PV00 on iter 0)
+                # FIRST. Then gather this PV1's V handles in a list and
+                # release them all after the o1 commit. Net per-iter PV1:
+                # 1 (v_carry) + num_d_chunks (PV1 inner) releases, matching
+                # num_d_chunks waits + the carried slot from prev step.
                 o1_handle = mma_corr_producer.acquire_and_advance()
                 s1_handle = mma_s1_producer.acquire_and_advance()
+                v_carry.release()
+                v_handles_pv1 = []
                 for d_chunk_idx in cutlass.range_constexpr(self.num_d_chunks):
                     v_handle = load_kv_consumer.wait_and_advance()
+                    v_handles_pv1.append(v_handle)
                     tOrVi = tOrV[None, None, None, v_handle.index]
                     inner_num_kphases = cute.size(tOrP0, mode=[2])
                     for kphase_idx in cutlass.range(
@@ -260,14 +296,22 @@ def mma_warp_body(
                         )
                         pv_whether_acc = True
                 o1_handle.commit()
-                v_handle.release()
+                for _i in cutlass.range_constexpr(self.num_d_chunks):
+                    v_handles_pv1[_i].release()
                 s1_handle.commit()
 
                 # --- GEMM_PV0i: P0 @ V_i, per D-chunk ---
+                # D=256 FIX: gather V handles; after the o0 commit release
+                # all but the LAST one. The last is retained as a new
+                # `v_carry` for the next iter's PV1 (or the post-loop PV1
+                # final if this was the last loop iter). `tOrVi` (a view
+                # into v_carry's slot) is what the post-loop reads.
                 o0_handle = mma_corr_producer.acquire_and_advance()
                 s0_handle = mma_s0_producer.acquire_and_advance()
+                v_handles_pv0 = []
                 for d_chunk_idx in cutlass.range_constexpr(self.num_d_chunks):
                     v_handle = load_kv_consumer.wait_and_advance()
+                    v_handles_pv0.append(v_handle)
                     tOrVi = tOrV[None, None, None, v_handle.index]
                     inner_num_kphases = cute.size(tOrP0, mode=[2])
                     for kphase_idx in cutlass.range(
@@ -283,10 +327,18 @@ def mma_warp_body(
                             tOtO0,
                         )
                 o0_handle.commit()
+                for _i in cutlass.range_constexpr(self.num_d_chunks - 1):
+                    v_handles_pv0[_i].release()
+                v_carry = v_handles_pv0[self.num_d_chunks - 1]
 
             # ============================================================
             # Tail PV1 final: P1 @ V_{N-1} (reuses tOrVi from last PV0i)
             # ============================================================
+            # D=256 FIX: release the FINAL v_carry (last PV0i's last d_chunk,
+            # or PV00's last d_chunk if loop_steps == 0). `tOrVi` is still
+            # valid here because we held v_carry across all loop iters that
+            # could have refilled the slot. This closes the V handle
+            # accounting: total releases == total waits, no per-iter leak.
             o1_handle = mma_corr_producer.acquire_and_advance()
             s1_handle = mma_s1_producer.acquire_and_advance()
             for d_chunk_idx in cutlass.range_constexpr(self.num_d_chunks):
@@ -306,7 +358,7 @@ def mma_warp_body(
                     )
                     pv_whether_acc = True
             o1_handle.commit()
-            v_handle.release()
+            v_carry.release()
 
             s0_handle.commit()
             s1_handle.commit()

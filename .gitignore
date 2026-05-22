@@ -1,3 +1,16 @@
-*/__pycache__/
-hello_cutedsl/__pycache__/
-element_wise/__pycache__/ gemm/__pycache__/
+# Byte-compiled / cached Python files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+*.egg-info/
+*.egg
+build/
+dist/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp

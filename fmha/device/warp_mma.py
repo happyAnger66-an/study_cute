@@ -207,18 +207,50 @@ def mma_warp_body(
             # (or to the tail PV1 if loop_steps == 0).
 
             # ============================================================
-            # Main loop: per remaining KV step run QK0i, QK1i, PV1(i-1), PV0i
+            # Main loop: strictly 4 phases per KV step in this order, mirroring
+            # the legacy single-chunk kernel:
+            #   QK0i  -> PV1(i-1) -> QK1i -> PV0i
+            #
+            # Critical pipeline invariants (the v1/v2 merged-QK attempt got
+            # these wrong and produced max_diff=99):
+            #
+            #   - ``s0_handle`` is acquired ONCE per kv step (in PV00 or the
+            #     previous PV0i) and committed at the END of QK0i. QK0i is
+            #     the producer that writes new S0 into the stage owned by
+            #     the s0 handle. After QK0i commits, softmax consumes S0,
+            #     writes P0 in-place and releases stage back to mma.
+            #
+            #   - ``s1_handle`` is acquired in PV1(i-1) (PV1 reads P1 which
+            #     lives in the S1 buffer) and committed at the END of QK1i.
+            #     QK1i writes NEW S1 into the same stage that PV1 just read
+            #     P1 from. Committing s1 before QK1i writes (the v2 bug)
+            #     races with softmax reading half-written S1.
+            #
+            #   - Q0 / Q1 / K handles are acquired in QK0i (Q1 also waited
+            #     in QK1i since LOAD produces one Q1 per d_chunk per kv
+            #     step). They are released at the END of QK1i because
+            #     QK1i still reads K and Q1.
+            #
+            # D-chunking note: every QK0i / QK1i d_chunk accumulates into
+            # the same S0 / S1 TMEM with ACCUMULATE=(d_chunk!=0 or
+            # kphase!=0); every PV0i / PV1 d_chunk accumulates into the
+            # same O0 / O1 with ACCUMULATE=True (PV1 also OR's
+            # ``pv_whether_acc`` for the very first PV1's first kphase).
             # ============================================================
             pv_whether_acc = False
             for i in cutlass.range(0, seqlen_kv_loop_steps, 1, unroll=1):
-                # --- GEMM_QK0i / QK1i: per D-chunk, then commit s0 once ---
+                # --- Phase 1: QK0i (write S0, commit s0) -------------------
+                # K is also needed by QK1i later in this iter, so K handles
+                # are stashed in a list and released at QK1i's tail.
+                k_handles = []
+                q0_handles = []
                 for d_chunk_idx in cutlass.range_constexpr(self.num_d_chunks):
                     q0_handle = load_q_consumer.wait_and_advance()
                     tSrQ0 = tSrQ[None, None, None, q0_handle.index]
-                    q1_handle = load_q_consumer.wait_and_advance()
-                    tSrQ1 = tSrQ[None, None, None, q1_handle.index]
+                    q0_handles.append(q0_handle)
                     k_handle = load_kv_consumer.wait_and_advance()
                     tSrKi = tSrK[None, None, None, k_handle.index]
+                    k_handles.append((k_handle, tSrKi))
                     inner_num_kphases = cute.size(tSrQ0, mode=[2])
                     for kphase_idx in cutlass.range(
                         inner_num_kphases, unroll_full=True
@@ -235,34 +267,13 @@ def mma_warp_body(
                             tSrKi[kphase_coord],
                             tStS0,
                         )
-                    inner_num_kphases = cute.size(tSrQ1, mode=[2])
-                    for kphase_idx in cutlass.range(
-                        inner_num_kphases, unroll_full=True
-                    ):
-                        kphase_coord = (None, None, kphase_idx)
-                        qk_tiled_mma.set(
-                            tcgen05.Field.ACCUMULATE,
-                            d_chunk_idx != 0 or kphase_idx != 0,
-                        )
-                        cute.gemm(
-                            qk_tiled_mma,
-                            tStS1,
-                            tSrQ1[kphase_coord],
-                            tSrKi[kphase_coord],
-                            tStS1,
-                        )
-                    q0_handle.release()
-                    q1_handle.release()
-                    k_handle.release()
                 s0_handle.commit()
 
-                # --- GEMM_PV1(i-1): P1 @ V_{i-1}, per D-chunk ---
-                # Consume the carry list from the previous PV0i (or PV00 on
-                # iter 0). Do NOT re-acquire V here -- LOAD only produces
-                # num_d_chunks V per kv tile and the previous PV0 step
-                # already owns them. After the o1 commit, release all
-                # carried handles -- this is what closes the per-iter V
-                # accounting loop.
+                # --- Phase 2: PV1(i-1) (read P1, write O1, release V_prev) -
+                # Acquire s1 here -- this both takes back P1 ownership for
+                # the PV1 reads AND will be used by QK1i below to write
+                # the NEW S1 into the same stage. Commit happens at the
+                # end of QK1i.
                 o1_handle = mma_corr_producer.acquire_and_advance()
                 s1_handle = mma_s1_producer.acquire_and_advance()
                 for d_chunk_idx in cutlass.range_constexpr(self.num_d_chunks):
@@ -289,12 +300,38 @@ def mma_warp_body(
                 o1_handle.commit()
                 for _i in cutlass.range_constexpr(self.num_d_chunks):
                     v_carry_list[_i][0].release()
+                # NB: s1_handle NOT committed here -- QK1i writes into it.
+
+                # --- Phase 3: QK1i (write S1 into the s1 stage just held) -
+                # Reuses K handles stashed in Phase 1 (same K per d_chunk).
+                for d_chunk_idx in cutlass.range_constexpr(self.num_d_chunks):
+                    q1_handle = load_q_consumer.wait_and_advance()
+                    tSrQ1 = tSrQ[None, None, None, q1_handle.index]
+                    _, tSrKi = k_handles[d_chunk_idx]
+                    inner_num_kphases = cute.size(tSrQ1, mode=[2])
+                    for kphase_idx in cutlass.range(
+                        inner_num_kphases, unroll_full=True
+                    ):
+                        kphase_coord = (None, None, kphase_idx)
+                        qk_tiled_mma.set(
+                            tcgen05.Field.ACCUMULATE,
+                            d_chunk_idx != 0 or kphase_idx != 0,
+                        )
+                        cute.gemm(
+                            qk_tiled_mma,
+                            tStS1,
+                            tSrQ1[kphase_coord],
+                            tSrKi[kphase_coord],
+                            tStS1,
+                        )
+                    q0_handles[d_chunk_idx].release()
+                    q1_handle.release()
+                    k_handles[d_chunk_idx][0].release()
                 s1_handle.commit()
 
-                # --- GEMM_PV0i: P0 @ V_i, per D-chunk ---
-                # Acquire num_d_chunks new V handles, gemm, then defer all
-                # releases by stashing (v_handle, tOrVi) into v_carry_list
-                # for the next iter's PV1 (or the tail PV1 below) to drain.
+                # --- Phase 4: PV0i (acquire V_i, write O0, defer release) -
+                # Acquire a fresh s0 here -- the next iter's QK0i commits
+                # it after writing the new S0 into the same stage.
                 o0_handle = mma_corr_producer.acquire_and_advance()
                 s0_handle = mma_s0_producer.acquire_and_advance()
                 v_carry_list = []
@@ -319,8 +356,9 @@ def mma_warp_body(
 
             # ============================================================
             # Tail PV1 final: P1 @ V_{N-1}, consuming the carry list from
-            # the last PV0i (or PV00 if loop_steps == 0). This is the last
-            # release of every V slot owned by this kv tile.
+            # the last PV0i (or PV00 if loop_steps == 0). Acquires a final
+            # s1 stage so we have a sane handle to commit alongside the
+            # outstanding s0_handle from the last PV0i.
             # ============================================================
             o1_handle = mma_corr_producer.acquire_and_advance()
             s1_handle = mma_s1_producer.acquire_and_advance()

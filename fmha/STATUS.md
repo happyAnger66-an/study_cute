@@ -37,44 +37,73 @@
 7. **D=128 / D=256 JIT 编译均通过** (本机 sm_89 仅能验编译, launch 时报
    `cudaErrorNoKernelImageForDevice` 是预期硬件不匹配)
 
-### Fix A — V-handle release 平衡 (Day 2, 今天)
+### Fix A v1 (废弃) — 错误分析的教训
 
-在 `fmha/device/warp_mma.py` 应用了 4 处修改, 把 V handle 的 wait/release
-计数完全配平, 消除 D=256 的死锁根因. 每处都附了详细注释:
+第一版以为每个 PV 段 (PV00 / PV1(i-1) / PV0i / PV1 final) 都要自己
+`wait_and_advance()` 来获取 V. 这是错的:
 
-- **PV00 (prologue)** L185-L212: 用 Python list `v_handles_pv00` 暂存所有
-  d_chunk 的 v_handle, `o0_handle.commit()` 后释放前 `num_d_chunks - 1` 个,
-  最后一个作为 `v_carry` 跨给主循环.
-- **PV1(i-1) (主循环)** L273-L302: 先 `v_carry.release()` (释放上轮 PV0i 的最后
-  defer 或 prologue 的 defer), 然后 gather + commit + 全部释放.
-- **PV0i (主循环)** L309-L332: gather + commit 后释放前 N-1 个, 最后一个作为新
-  `v_carry`.
-- **PV1 final (尾声)** L337-L361: 把原 `v_handle.release()` 改成
-  `v_carry.release()`, 释放最后一次 PV0i 的尾巴 (或 loop_steps=0 时的 prologue 尾巴).
+- LOAD 端每 kv tile 只产 `num_d_chunks` 个 V
+- 但 v1 让 MMA 每 iter 想 wait `2 * num_d_chunks` 个 V (PV1 一遍, PV0 一遍)
+- 结果 D=128 / D=256 都立刻在 PV1 wait_and_advance 上死锁
 
-### 死锁机理(回顾)
+用户在 Blackwell 真机上跑 v1 复现了这个错误: `Compilation time: 3.66s →
+LLM multi-round prefill test Round 1 (kernel launch) → GPU 100% / CPU 低`,
+device 端 mbarrier 卡住.
 
-旧代码每 KV iter V 计数失衡:
-| 段落 | waits | releases (legacy) | leak |
-| --- | --- | --- | --- |
-| PV00 prologue | `num_d_chunks` | `0` | `num_d_chunks` |
-| PV1(i-1) | `num_d_chunks` | `1` (循环外) | `num_d_chunks - 1` |
-| PV0i | `num_d_chunks` | `0` | `num_d_chunks` |
-| PV1 final | `0` | `1` | `-1` |
+### Fix A v2 (当前) — 真正的"acquire-defer-release"对偶
 
-- **D=128** (`num_d_chunks=1`): 总 leak ≈ 1, `kv_stage=3` 能撑住 → **侥幸跑通**
-- **D=256** (`num_d_chunks=2`): 单 iter leak `3`, 超 `kv_stage=3` → **LOAD acquire 死锁**
+学习了 `TensorRT-Edge-LLM/kernelSrcs/fmha_cutedsl_blackwell/fmha.py` 的原版本,
+明白了原版的 V handle 模式:
 
-Fix A 后, per iter V waits = `2 * num_d_chunks` = V releases (1 carry + N PV1 + (N-1) PV0).
-全局零泄漏: 整个 kernel `waits = D + 2D*N == releases`. ✓
+```
+PV00 prologue: v_handle = wait()           # acquire V_0, NO release here
+               tOrVi = view(V_0)
+               gemm(P0, tOrVi)
+               o0_commit                   # defer release
+
+iter i:
+  QK0i:        K wait, gemm S0, s0_commit
+  PV1(i-1):    # NO new wait! Use tOrVi from outer scope (= V_{i-1})
+               gemm(P1, tOrVi)
+               o1_commit
+               v_handle.release()          # ← release V_{i-1} HERE
+  QK1i:        gemm S1, s1_commit, K release
+  PV0i:        v_handle = wait()           # acquire V_i, NO release
+               tOrVi = view(V_i)
+               gemm(P0, tOrVi)
+               o0_commit                   # defer release
+
+Tail PV1:      # NO wait! Use tOrVi from outer scope (= V_{N-1})
+               gemm(P1, tOrVi)
+               o1_commit
+               v_handle.release()          # ← release V_{N-1}
+```
+
+每个 V handle 精确 1 acquire (在 PV0/PV00) + 1 release (在紧跟着的下一个
+PV1/tail PV1). 零泄漏, 完美 1-1 配对.
+
+**D-chunking (D=256) 扩展**: 每个 PV 段需要遍历 `num_d_chunks` 个 V handle
+(不同 D 维数据). 用 Python list `v_carry_list = [(v_handle, tOrVi), ...]`
+把整组传给下一个 PV 段. PV1 段用 `v_carry_list[d_chunk_idx]` 取对应 d_chunk
+的 tOrVi 做 gemm (这同时修复了 D=256 计算错误 — 否则只用 outer-scope 单个
+tOrVi 等于丢失了非最后 d_chunk 的 V 数据), 然后释放所有 handle.
+
+**代码变更**: `fmha/device/warp_mma.py` 净 -57/+42 行:
+- PV00: 用 `v_carry_list` 暂存 `num_d_chunks` 个 `(v_handle, tOrVi)`, defer 全部 release
+- PV1(i-1): 不再 `wait_and_advance`, 遍历 `v_carry_list[d_chunk_idx]` 用对应
+  tOrVi gemm, commit 后释放 `v_carry_list` 全部 handle
+- PV0i: 重新初始化 `v_carry_list = []`, 遍历 acquire 新一轮 V handle, defer 全部
+- Tail PV1: 同 PV1 模式 (遍历 list + 释放全部)
 
 ### 关键时序约束
 
-`cute.gemm` 是 async — Python 调用返回时 tensor cores 还在读 V SMEM. 必须
-先 `o_handle.commit()` (隐含等待 tensor cores 完成), 然后才 `v_handle.release()`.
-所以修复用 Python list 暂存所有 d_chunk 的 v_handle, commit 后才统一 release.
-list 本身是 Python compile-time 对象 (`num_d_chunks` 是 const_expr), 不会
-进入 DSL 动态域.
+`cute.gemm` 是 async, 必须先 `o_handle.commit()` 才能 `v_handle.release()`,
+否则 tensor cores 还在读 V SMEM 时 LOAD 可能 refill 该 slot. 新代码保留了
+"先 commit 后 release" 的顺序.
+
+`v_carry_list` 本身是 Python compile-time 对象 (因为 `num_d_chunks` 是 const_expr,
+d_chunk 循环在 trace 时全部展开). list 中存的 `v_handle` 和 `tOrVi` 是 DSL 值
+引用, 跨 PV 段流动符合 DSL 的 SSA 风格.
 
 ---
 

@@ -227,6 +227,11 @@ def mma_warp_body(
                 for i in cutlass.range(
                     0, seqlen_kv_loop_steps, 1, unroll=1
                 ):
+                    if cutlass.const_expr(self.debug_pipeline):
+                        cute.printf(
+                            "MMA d_outer=%d iter=%d start QK0i\n",
+                            d_chunk_outer, i,
+                        )
                     # --- Phase 1: QK0i (write S0, commit s0) ---
                     k_handles = []
                     q0_handles = []
@@ -239,6 +244,12 @@ def mma_warp_body(
                         k_handle = load_kv_consumer.wait_and_advance()
                         tSrKi = tSrK[None, None, None, k_handle.index]
                         k_handles.append((k_handle, tSrKi))
+                        if cutlass.const_expr(self.debug_pipeline):
+                            cute.printf(
+                                "  QK0i d_outer=%d iter=%d d_inner=%d q0=%d k=%d\n",
+                                d_chunk_outer, i, d_chunk_idx,
+                                q0_handle.index, k_handle.index,
+                            )
                         inner_num_kphases = cute.size(tSrQ0, mode=[2])
                         for kphase_idx in cutlass.range(
                             inner_num_kphases, unroll_full=True
@@ -256,6 +267,11 @@ def mma_warp_body(
                                 tStS0,
                             )
                     s0_handle.commit()
+                    if cutlass.const_expr(self.debug_pipeline):
+                        cute.printf(
+                            "  s0.commit d_outer=%d iter=%d -> PV1\n",
+                            d_chunk_outer, i,
+                        )
 
                     # --- Phase 2: PV1(i-1) (read P1, gemm O1, release V_prev)
                     o1_handle = mma_corr_producer.acquire_and_advance()
@@ -279,6 +295,11 @@ def mma_warp_body(
                         pv_whether_acc = True
                     o1_handle.commit()
                     v_handle.release()
+                    if cutlass.const_expr(self.debug_pipeline):
+                        cute.printf(
+                            "  PV1 done d_outer=%d iter=%d (v released)\n",
+                            d_chunk_outer, i,
+                        )
                     # s1_handle NOT committed here -- QK1i writes into it.
 
                     # --- Phase 3: QK1i (write S1, commit s1)
@@ -313,6 +334,11 @@ def mma_warp_body(
                     o0_handle = mma_corr_producer.acquire_and_advance()
                     s0_handle = mma_s0_producer.acquire_and_advance()
                     v_handle = load_kv_consumer.wait_and_advance()
+                    if cutlass.const_expr(self.debug_pipeline):
+                        cute.printf(
+                            "  PV0i d_outer=%d iter=%d v=%d\n",
+                            d_chunk_outer, i, v_handle.index,
+                        )
                     tOrVi = tOrV[None, None, None, v_handle.index]
                     inner_num_kphases = cute.size(tOrP0, mode=[2])
                     for kphase_idx in cutlass.range(
@@ -332,6 +358,10 @@ def mma_warp_body(
                 # ============================================================
                 # Tail PV1 final: P1 @ V_{N-1}, single V mode.
                 # ============================================================
+                if cutlass.const_expr(self.debug_pipeline):
+                    cute.printf(
+                        "MMA d_outer=%d tail PV1 start\n", d_chunk_outer
+                    )
                 o1_handle = mma_corr_producer.acquire_and_advance()
                 s1_handle = mma_s1_producer.acquire_and_advance()
                 num_kphases = cute.size(tOrP1, mode=[2])
@@ -353,6 +383,11 @@ def mma_warp_body(
 
                 s0_handle.commit()
                 s1_handle.commit()
+                if cutlass.const_expr(self.debug_pipeline):
+                    cute.printf(
+                        "MMA d_outer=%d tail done (s0/s1 committed)\n",
+                        d_chunk_outer,
+                    )
             # End of d_chunk_outer loop
 
         # Advance to next tile

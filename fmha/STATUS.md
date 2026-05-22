@@ -1,10 +1,12 @@
 # FMHA 重构 + D=256 死锁修复 — 进度快照
 
-> 最后更新: 2026-05-22 (Friday) ~23:55 UTC+8
+> 最后更新: 2026-05-23 (Saturday) ~01:15 UTC+8
 > 状态:
 >   - **D=128**: 完全通过 (v3 修复 deadlock + 精度, prefill 3 轮 PASS, max_diff=0.0006)
->   - **D>128 (含 D=256)**: 已切换到 **d_chunk 外层 loop** 设计 ("outer-loop"),
->     待 Blackwell 真机验证。设计细节见 `docs/d_chunk_redesign.md`。
+>   - **D=256 outer-loop**: Round 1 **PASS** (max_diff=0.000612, 单 KV tile),
+>     **Round 2 死锁** (1 个 main loop iter)。需要 trace 定位卡点。
+>   - debug 开关已改为 env 变量: `FMHA_DEBUG_PIPELINE=1` 启用 cute.printf
+>     trace; 当前 LOAD/MMA 在每个 d_outer 边界 / main loop phase 都有 trace。
 >
 > D-chunking 设计演进:
 >   - 原设计 (broken): PV inner d_chunk loop, 把多 chunk V 累加到同一个 tOtO0 →
@@ -204,22 +206,48 @@ correction final epilog 写 sO; epilogue 取 sO TMA store 到 gO[d_chunk_outer]�
 
 ---
 
-## 🔜 待办 — 在 Blackwell 真机上跑
+## 🔜 待办 — D=256 Round 2 死锁诊断
 
-本机 sm_89/Ada 跑不了 Blackwell tcgen05 kernel, 以下命令需在 Blackwell GPU 上跑:
+**当前现象** (Blackwell 真机上跑, 2026-05-23):
+
+```
+python3 fmha/fmha.py --q_shape 1,128,8,256 --k_shape 1,128,8,256 --is_persistent
+... outer-loop mode, num_d_chunks=2 ...
+--- Round 1/3 (pos=0, s_k=128, cap=384) ---
+  batch 0: PASS  max_diff=0.000612   ← Round 1 完美通过!
+--- Round 2/3 (pos=128, s_k=256, cap=384) ---
+  挂死 (无输出)
+```
+
+Round 1 走 0 个 main loop iter (单 KV tile, prologue+tail), 通过.
+Round 2 走 1 个 main loop iter (2 KV tiles), 挂死.
+
+**已加诊断**:
+- `host/config.py`: `debug_pipeline` 改为 env-gated, 通过 `FMHA_DEBUG_PIPELINE=1` 启用.
+- `device/warp_mma.py`: main loop 每个 phase (QK0i / PV1 / QK1i / PV0i) 有
+  d_outer + iter idx + KV stage idx printf, tail 完成也有 printf.
+- `device/warp_load.py`: prologue + main iter 起头 / 每个 K/V acquire / d_outer
+  结束都有 printf.
+
+**下一步**: 在 Blackwell 上跑以下命令, 把 trace 输出贴回来定位卡点:
 
 ```bash
 cd /path/to/study_cute
 rm -rf fmha/__pycache__ fmha/host/__pycache__ fmha/device/__pycache__
 
-# ① D=128 回归 (v3 必须修复 v2 的精度错: max_diff=99.7)
-python3 fmha/fmha.py --q_shape 1,256,8,128 --k_shape 1,256,8,128 --is_persistent
-# 预期: 内置 3 轮 prefill ref check 全部 PASS, max_diff < 0.1 (而非 v2 的 99.7)
+FMHA_DEBUG_PIPELINE=1 FMHA_DEBUG_ROUNDS=2 \
+  python3 fmha/fmha.py --q_shape 1,128,8,256 --k_shape 1,128,8,256 \
+  --is_persistent 2>&1 | tee /tmp/fmha_d256_trace.log
+# 死锁后 Ctrl+C, 看 /tmp/fmha_d256_trace.log 的最后输出.
+# 重点看 Round 2 期间最后一条 trace: LOAD 卡在哪个 K/V acquire? MMA 卡在 PV1/PV0i?
+```
 
-# ② D=256 + reference check + 3 轮 prefill (现在期望 PASS)
-python3 fmha/fmha.py --q_shape 1,128,8,256 --k_shape 1,128,8,256 --is_persistent
-python3 fmha/fmha.py --q_shape 1,256,8,256 --k_shape 1,256,8,256 --is_persistent
-# 预期: 3 轮 prefill 全 PASS, max_diff < 0.1
+**其他诊断命令** (Blackwell 上仍可跑的回归):
+
+```bash
+# ① D=128 回归: 确认 outer-loop 路径在 num_d_chunks=1 退化时仍 PASS
+python3 fmha/fmha.py --q_shape 1,256,8,128 --k_shape 1,256,8,128 --is_persistent
+# 预期: 3 轮 prefill PASS, max_diff < 0.1
 
 # ③ 如有需要, 单 KV tile / 多 KV tile + skip ref:
 python3 fmha/fmha.py --q_shape 1,128,8,256 --k_shape 1,128,8,256 \

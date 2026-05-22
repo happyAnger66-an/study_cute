@@ -239,6 +239,11 @@ def load_warp_body(
                 for i in cutlass.range(
                     0, seqlen_kv_loop_steps, 1, unroll=1
                 ):
+                    if cutlass.const_expr(self.debug_pipeline):
+                        cute.printf(
+                            "LOAD main d_outer=%d iter=%d start\n",
+                            d_chunk_outer, i,
+                        )
                     for d_chunk_idx in cutlass.range_constexpr(
                         self.num_d_chunks
                     ):
@@ -256,6 +261,11 @@ def load_warp_body(
                             tma_bar_ptr=q0_handle.barrier,
                         )
                         k_handle = load_kv_producer.acquire_and_advance()
+                        if cutlass.const_expr(self.debug_pipeline):
+                            cute.printf(
+                                "  LOAD K d_outer=%d iter=%d d_inner=%d slot=%d\n",
+                                d_chunk_outer, i, d_chunk_idx, k_handle.index,
+                            )
                         cute.copy(
                             tma_atom_k,
                             tKgK[None, kv_coord],
@@ -273,6 +283,11 @@ def load_warp_body(
                         None, d_chunk_outer, None, curr_block_coord_kv[2]
                     ]
                     v_handle = load_kv_producer.acquire_and_advance()
+                    if cutlass.const_expr(self.debug_pipeline):
+                        cute.printf(
+                            "  LOAD V d_outer=%d iter=%d slot=%d\n",
+                            d_chunk_outer, i, v_handle.index,
+                        )
                     cute.copy(
                         tma_atom_v,
                         tVgV[None, kv_coord],
@@ -281,6 +296,11 @@ def load_warp_body(
                     )
                     kv_coord += 1
                 # End of seqlen_kv loop for this d_chunk_outer
+                if cutlass.const_expr(self.debug_pipeline):
+                    cute.printf(
+                        "LOAD d_outer=%d done (kv loop end)\n",
+                        d_chunk_outer,
+                    )
 
         tile_sched.advance_to_next_work()
         work_tile = tile_sched.get_current_work()

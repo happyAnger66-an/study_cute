@@ -14,6 +14,7 @@ and :mod:`fmha.device.*` respectively, and are bound onto this class from
 """
 
 import math
+import os
 from typing import Optional, Tuple, Type
 
 import cutlass
@@ -257,9 +258,10 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.softmax_prescale_ln = self.softmax_prescale_log2 * 0.6931471805599453
 
     # ------------------------------------------------------------------
-    # Debug trace gate (off by default)
+    # Debug trace gate (env-gated)
     # ------------------------------------------------------------------
     # Setting this to True enables cute.printf traces in the load/mma warps
     # so the producer/consumer pipeline can be observed step by step. The
     # printf is const_expr-gated, so when False it has zero runtime cost.
-    debug_pipeline = False
+    # Toggle via FMHA_DEBUG_PIPELINE=1 in the environment.
+    debug_pipeline = bool(int(os.environ.get("FMHA_DEBUG_PIPELINE", "0")))

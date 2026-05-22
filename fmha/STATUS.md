@@ -1,9 +1,12 @@
 # FMHA 重构 + D=256 死锁修复 — 进度快照
 
-> 最后更新: 2026-05-22 (Friday) ~22:50 UTC+8
-> 状态: **Fix A v3 (4 段精度修复)** 完成, D=128/D=256 都编译通过, 待 Blackwell 真机验证
+> 最后更新: 2026-05-22 (Friday) ~23:05 UTC+8
+> 状态:
+>   - **D=128**: 完全通过 (v3 修复 deadlock + 精度, prefill 3 轮 PASS, max_diff=0.0006)
+>   - **D>128**: 已在 host config 里 **reject**, 因为 D-chunking 设计层面 broken
+>     (详见 `docs/d_chunk_redesign.md`)
 >
-> 修复历史:
+> 修复历史 (主循环 4 段):
 >   - v1: 错把 PV1 也 wait V → D=128 死锁 (废弃)
 >   - v2: 用 `v_carry_list` 对 V handle "acquire-defer-release" → 死锁消除, 但
 >         **合并了 QK0i/QK1i 段**, 让 `s1_handle` 在 PV1 段提前 commit, QK1i 写 S1
@@ -11,6 +14,12 @@
 >         D=128 精度爆掉 `max_diff=99.7` (废弃)
 >   - v3 (当前): 严格按原版 4 段顺序 `QK0i → PV1(i-1) → QK1i → PV0i`, s0/s1 跨段
 >         共享句柄, 修复 v2 的精度问题, 同时保留 v2 的 V-handle carry list 设计
+>
+> D>128 设计 bug (Blackwell 真机诊断确认):
+>   - PV gemm 把 num_d_chunks 个 V 累加到同一个 tOtO0 → d 维度被错误 reduce
+>   - Epilogue 把同一份 sO copy 到 num_d_chunks 个 gO slice → 每个 d_chunk 输出相同
+>   - 验证: `actual[i] == chunk_0_ref[i] + chunk_1_ref[i]` 逐元素精确成立
+>   - 必须 per-d_chunk 跑 PV+correction+epilogue, 涉及 3 个 warp 重构, 工作量 1-2 天
 
 ---
 

@@ -213,11 +213,27 @@ class BlackwellFusedMultiHeadAttentionForward:
                 f"see study_cute/docs/support_d256.md"
             )
         if self.num_d_chunks > 1:
-            print(
-                f"[fmha] D-chunking: head_dim={self.head_dim}, "
-                f"d_chunk_k={self.d_chunk_k}, num_d_chunks={self.num_d_chunks}, "
-                f"stages q={self.q_stage} kv={self.kv_stage} epi={self.epi_stage}, "
-                f"estimated staged SMEM={est} bytes"
+            # D>128 path is currently broken at the design level (see
+            # docs/d_chunk_redesign.md):
+            #   1. PV gemm accumulates O across d_chunks into the same
+            #      tOtO0/tOtO1 region (reduces d, instead of concatenating)
+            #   2. Epilogue stores the same sO to every gO[d_chunk] slice
+            # Verified on Blackwell: actual == sum_over_d_chunks(ref_chunk),
+            # and chunk_0_actual == chunk_1_actual. Fixing requires a
+            # per-d_chunk PV+correction+epilogue pipeline (mma /
+            # correction / epilogue warps all need restructuring).
+            #
+            # Until that redesign lands, reject D>128 at compile time so
+            # users don't get silently-wrong results (or worse, deadlocks
+            # in later prefill rounds).
+            raise ValueError(
+                f"FMHA D>128 (head_dim={self.head_dim}, "
+                f"num_d_chunks={self.num_d_chunks}) is currently unsupported: "
+                f"the D-chunking pipeline accumulates PV across d_chunks "
+                f"and replicates the same sO to every gO d_chunk slice, "
+                f"producing wrong results. See "
+                f"study_cute/docs/d_chunk_redesign.md for the diagnosis "
+                f"and the required redesign."
             )
 
     def _setup_attributes(self):

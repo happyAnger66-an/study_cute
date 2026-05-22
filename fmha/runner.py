@@ -405,7 +405,9 @@ def run(
             0.13 if (out_dtype.is_float and out_dtype.width <= 8) else tolerance
         )
         if not isinstance(s_q, tuple) and not isinstance(s_k, tuple):
-            _num_rounds = 3
+            # FMHA_DEBUG_ROUNDS env var caps num_rounds for diagnostics
+            # (e.g. set to 1 to skip later rounds that may deadlock).
+            _num_rounds = int(os.environ.get("FMHA_DEBUG_ROUNDS", "3"))
             _prefill_seq = min(s_q, s_k)
             _cap = _prefill_seq * _num_rounds
             print(
@@ -644,6 +646,53 @@ def run_llm_multi_round_prefill_test(
                     f"  batch {bi}: PASS  max_diff={max_diff:.6f}  "
                     f"mean_diff={mean_diff:.6f}"
                 )
+
+            # FMHA_DEBUG_DCHUNK: per-d_chunk breakdown to detect if D>128
+            # PV gemm is wrongly accumulating across d_chunks. Prints, for
+            # head=0 token=0, the GPU output / numpy ref / abs(diff) summed
+            # over each 128-wide d_chunk slice. If GPU O matches ref on
+            # d_chunk_0 but differs on d_chunk_1 (or all chunks look like
+            # a sum of the per-chunk truths), the bug is in the PV
+            # accumulation / epilogue replication.
+            if os.environ.get("FMHA_DEBUG_DCHUNK"):
+                head_dim = o_actual.shape[-1]
+                d_chunk_k = 128
+                if head_dim > d_chunk_k:
+                    num_d_chunks = (head_dim + d_chunk_k - 1) // d_chunk_k
+                    print(
+                        f"    [DCHUNK] head_dim={head_dim} "
+                        f"num_d_chunks={num_d_chunks}"
+                    )
+                    for ci in range(num_d_chunks):
+                        lo = ci * d_chunk_k
+                        hi = min(lo + d_chunk_k, head_dim)
+                        a_chunk = o_actual[..., lo:hi]
+                        r_chunk = o_ref[..., lo:hi]
+                        d_chunk = np.abs(a_chunk - r_chunk)
+                        print(
+                            f"    [DCHUNK chunk={ci} d=[{lo}:{hi})] "
+                            f"actual: mean={a_chunk.mean():.4f} "
+                            f"max={np.abs(a_chunk).max():.4f}  "
+                            f"ref: mean={r_chunk.mean():.4f} "
+                            f"max={np.abs(r_chunk).max():.4f}  "
+                            f"diff: mean={d_chunk.mean():.4f} "
+                            f"max={d_chunk.max():.4f}"
+                        )
+                    # Token 0, head 0: print first few values of each chunk
+                    print(
+                        f"    [DCHUNK token=0 head=0] (first 8 values "
+                        f"per chunk)"
+                    )
+                    for ci in range(num_d_chunks):
+                        lo = ci * d_chunk_k
+                        a_slice = o_actual[0, 0, lo:lo + 8]
+                        r_slice = o_ref[0, 0, lo:lo + 8]
+                        print(
+                            f"      chunk={ci} actual={a_slice.tolist()}"
+                        )
+                        print(
+                            f"      chunk={ci}    ref={r_slice.tolist()}"
+                        )
         current_pos += seq_len
 
     if all_pass:

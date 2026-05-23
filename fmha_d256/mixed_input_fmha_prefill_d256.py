@@ -44,6 +44,7 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Int32, Int64, Float32
+from cutlass.cute import testing as cute_testing
 
 # study_cute migration: original imports were
 #   `from helpers import fmha_helpers as fmha_utils`
@@ -1851,6 +1852,58 @@ def run(
         torch.testing.assert_close(o_ref, o_result, atol=tolerance, rtol=1e-05)
 
         print("Results verified successfully!")
+
+    # ------------------------------------------------------------------
+    # Benchmark (study_cute addition, NOT in upstream).
+    # Only runs when iterations > 0; warmup_iterations may be 0.
+    # Returns avg latency in microseconds so the CLI shim can print a
+    # summary. Pure no-op when iterations <= 0 (return None).
+    # ------------------------------------------------------------------
+    if iterations > 0:
+        kernel_args = cute_testing.JitArguments(
+            q_tensor.iterator,
+            k_tensor.iterator,
+            v_tensor.iterator,
+            o_tensor.iterator,
+            scale_k_tensor.iterator,
+            scale_v_tensor.iterator,
+            problem_size,
+            scale_softmax_log2,
+            scale_output,
+            window_size_left if window_size_left is None else Int32(window_size_left),
+            (
+                window_size_right
+                if window_size_right is None
+                else Int32(window_size_right)
+            ),
+            current_stream,
+        )
+        avg_time_us = cute_testing.benchmark(
+            compiled_fmha,
+            kernel_arguments=kernel_args,
+            warmup_iterations=warmup_iterations,
+            iterations=iterations,
+            stream=current_stream,
+        )
+        # FMHA FLOPs: QK is 2*B*H_q*S_q*S_k*D, PV is 2*B*H_q*S_q*S_k*D
+        # (softmax exp/div is treated as non-MAC, dominant cost is the two GEMMs).
+        # Causal halves the effective work; we conservatively use the same 0.5
+        # factor as the cutlass reference benchmarks.
+        flops = 4.0 * b * h_q * s_q * s_k * d
+        if is_causal:
+            flops *= 0.5
+        tflops = flops / (avg_time_us * 1e-6) / 1e12
+        print(
+            f"[benchmark] avg latency: {avg_time_us:.3f} us "
+            f"(warmup={warmup_iterations}, iterations={iterations})"
+        )
+        print(
+            f"[benchmark] throughput: {tflops:.2f} TFLOPS  "
+            f"(B={b}, H_q={h_q}, H_k={h_k}, S_q={s_q}, S_k={s_k}, "
+            f"D={d}, is_causal={is_causal}, is_persistent={is_persistent})"
+        )
+        return avg_time_us
+    return None
 
 
 if __name__ == "__main__":

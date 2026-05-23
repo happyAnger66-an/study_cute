@@ -125,15 +125,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Test driver
     parser.add_argument("--tolerance", type=float, default=1e-1)
-    parser.add_argument("--warmup_iterations", type=int, default=0)
-    parser.add_argument("--iterations", type=int, default=1)
+    parser.add_argument(
+        "--warmup_iterations", type=int, default=10,
+        help="Number of warm-up kernel launches before timing.",
+    )
+    parser.add_argument(
+        "--iterations", type=int, default=100,
+        help="Number of timed kernel launches. Set to 0 to skip benchmarking.",
+    )
     parser.add_argument(
         "--skip_ref_check", action="store_true",
         help="Skip torch reference check (faster smoke test).",
     )
     parser.add_argument(
         "--use_cold_l2", action="store_true", default=False,
-        help="Use circular buffer tensor sets for L2-cold benchmarking.",
+        help="(Reserved; kernel is L2-hot benchmarked unless this is set in the future.)",
+    )
+    parser.add_argument(
+        "--no_benchmark", action="store_true",
+        help="Disable benchmarking entirely (equivalent to --iterations 0).",
     )
 
     return parser
@@ -151,7 +161,9 @@ def main(argv=None) -> int:
     if not torch.cuda.is_available():
         raise RuntimeError("GPU is required to run this example!")
 
-    run(
+    iterations = 0 if args.no_benchmark else args.iterations
+
+    latency_us = run(
         args.q_shape,
         args.k_shape,
         args.q_dtype,
@@ -170,10 +182,32 @@ def main(argv=None) -> int:
         args.scale_softmax,
         args.tolerance,
         args.warmup_iterations,
-        args.iterations,
+        iterations,
         args.skip_ref_check,
         args.use_cold_l2,
     )
+
+    # Already printed inside `run()` when iterations > 0; surface a compact
+    # one-line summary as well so it's easy to grep from CI logs.
+    if latency_us is not None:
+        b, h_q, s_q, _ = args.q_shape
+        _, h_k, s_k, d = args.k_shape
+        flops = 4.0 * b * h_q * s_q * s_k * d
+        if args.is_causal:
+            flops *= 0.5
+        tflops = flops / (latency_us * 1e-6) / 1e12
+        # Approximate IO bytes: BF16 Q + Int8 K/V + BF16 O + BF16 scales.
+        bytes_q = b * h_q * s_q * d * 2
+        bytes_kv = 2 * b * h_k * s_k * d * 1
+        bytes_o = b * h_q * s_q * d * 2
+        bytes_scale = 2 * b * h_k * s_k * (d // args.scale_granularity) * 2
+        gb = (bytes_q + bytes_kv + bytes_o + bytes_scale) / 1e9
+        bw = gb / (latency_us * 1e-6)
+        print(
+            f"[fmha_d256] summary: latency={latency_us:.3f} us  "
+            f"tflops={tflops:.2f}  io_bw={bw:.2f} GB/s  "
+            f"shape=(B={b},H_q={h_q},H_k={h_k},S_q={s_q},S_k={s_k},D={d})"
+        )
 
     print("PASS")
     return 0

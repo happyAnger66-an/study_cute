@@ -17,10 +17,11 @@ study_cute 仓库下,方便在 Jetson Thor (sm_100a) 上跑 head_dim=256 的 FMH
 
 | Change | Line | Why |
 | --- | --- | --- |
-| Import rewrites (`from helpers import ...` → `from fmha_d256 import ...`) | 48-58 | Repo layout 适配 |
+| Import rewrites (`from helpers import ...` → `from fmha_d256 import ...`) | 48-62 | Repo layout 适配 |
 | 去掉 `storage.tmem_holding_buf.ptr` / `storage.tmem_dealloc_mbar.ptr` 的 `.ptr` | 666 / 670 | Thor 上 DSL (`nvidia-cutlass-dsl` <= 4.4.2) 中 `storage.<scalar_field>` 已经直接返回 `_Pointer`, 没有 `.ptr` 属性 (新 DSL 才加上的 wrapper) |
+| 在 `run()` 末尾追加 `cute.testing.benchmark` block + 让 `run()` 返回 latency (us) | 1855-1905 | upstream 的 `warmup_iterations` / `iterations` 参数*没有被消费*; 这里补上真正的 timing 逻辑 (warm-up + 多次 launch + cuda event) + 算 TFLOPS |
 
-其余 100% 与官方一致,便于后续 follow upstream。
+除上述 3 处外,与官方一致,便于后续 follow upstream。
 
 ## 接口契约
 
@@ -59,29 +60,55 @@ loop (cumulative seqlen + packed cache),需要后续做接口适配 — 见底�
 cd <study_cute root>
 export CUTE_DSL_ARCH=sm_100a    # 关键: 必须显式指定 Blackwell arch
 
-# (1) 基础 smoke test (无 ref check, 最快验证 kernel 能跑通)
+# (1) 基础 smoke test (无 ref check, 最快验证 kernel 能跑通; 不 benchmark)
+python3 fmha_d256/fmha_d256.py \
+    --q_shape 1,8,256,256 --k_shape 1,8,256,256 \
+    --is_persistent --skip_ref_check --no_benchmark
+
+# (2) 带 ref check 的精度验证 + 默认 benchmark (warmup=10, iters=100)
+python3 fmha_d256/fmha_d256.py \
+    --q_shape 1,8,256,256 --k_shape 1,8,256,256 \
+    --is_persistent
+
+# (3) 纯 benchmark (跳过 ref check, 默认 warmup=10/iters=100)
 python3 fmha_d256/fmha_d256.py \
     --q_shape 1,8,256,256 --k_shape 1,8,256,256 \
     --is_persistent --skip_ref_check
 
-# (2) 带 ref check 的精度验证
+# (4) 调高 iters 让结果更稳
 python3 fmha_d256/fmha_d256.py \
-    --q_shape 1,8,256,256 --k_shape 1,8,256,256 \
-    --is_persistent
+    --q_shape 1,8,1024,256 --k_shape 1,8,1024,256 \
+    --is_persistent --skip_ref_check \
+    --warmup_iterations 50 --iterations 500
 
-# (3) Causal 模式
+# (5) Causal 模式
 python3 fmha_d256/fmha_d256.py \
     --q_shape 1,8,512,256 --k_shape 1,8,512,256 \
     --is_persistent --is_causal
 
-# (4) GQA (H_q != H_k)
+# (6) GQA (H_q != H_k)
 python3 fmha_d256/fmha_d256.py \
     --q_shape 1,8,256,256 --k_shape 1,1,256,256 \
     --is_persistent
 
-# (5) 完整 CLI 选项
+# (7) 完整 CLI 选项
 python3 fmha_d256/fmha_d256.py --help
 ```
+
+### Benchmark 输出格式
+
+带默认 `--iterations >= 1` 时,会打印两行 perf summary:
+
+```
+[benchmark] avg latency: 12.345 us (warmup=10, iterations=100)
+[benchmark] throughput: 78.90 TFLOPS  (B=1, H_q=8, H_k=8, S_q=256, S_k=256, D=256, is_causal=False, is_persistent=True)
+[fmha_d256] summary: latency=12.345 us  tflops=78.90  io_bw=10.20 GB/s  shape=(B=1,H_q=8,H_k=8,S_q=256,S_k=256,D=256)
+```
+
+- **`latency`** — `cute.testing.benchmark` 用 CUDA Event 测的平均 us
+- **`tflops`** — `4 × B × H_q × S_q × S_k × D / latency` (causal 时乘 0.5; 只算 QK + PV 两个 GEMM 的 MAC 部分,softmax 算力忽略)
+- **`io_bw`** — 一次 attention 的输入/输出字节数 / latency, 公式:
+  `bytes = BF16 Q + INT8 K + INT8 V + BF16 O + BF16 scale_k + BF16 scale_v`
 
 ### 已知 Thor 兼容性修复
 

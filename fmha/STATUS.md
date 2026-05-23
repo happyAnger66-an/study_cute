@@ -1,23 +1,33 @@
 # FMHA 重构 + D=256 死锁修复 — 进度快照
 
-> 最后更新: 2026-05-23 (Saturday) ~22:30 UTC+8
+> **🆕 D=256 新路径 (推荐, 不在本目录)**: 已迁移 CUTLASS 官方 d=256 实现到
+> `study_cute/fmha_d256/`, 用 2-CTA cluster + iterations_pv=2 (同 MMA session
+> 内多 TMEM ACC slot) 设计, 性能 / 健壮性都优于本目录的 outer-loop 设计。
+> 见 `fmha_d256/README.md`。本目录 (`fmha/`) 现定位为"学习 D≤128 outer-loop /
+> pipeline 设计"的参考。
+>
+> 最后更新: 2026-05-23 (Saturday) ~23:10 UTC+8
 > 状态:
 >   - **D=128**: 完全通过 (v3 修复 deadlock + 精度, prefill 3 轮 PASS, max_diff=0.0006)
 >   - **D=256 outer-loop**: Round 1 **PASS** (max_diff=0.000612, 单 KV tile),
 >     **Round 2 死锁** (multi KV tile, loop_steps≥1)。
->   - 诊断结论:
->     1. `dmesg` 没有 nvidia/xid/gpu fault, 排除硬件错误 (Thor 用 nvgpu 驱动框架)
+>   - 今日诊断结论 (已确认):
+>     1. `dmesg` 没有 nvidia/xid/gpu fault, 排除硬件错误
+>        (Thor 用 nvgpu 驱动框架, 但 hard fault 仍会进 dmesg)
 >     2. `cuda-gdb` host 栈 stuck 在 `ioctl/cuMemcpyDtoHAsync_v2/cupy.ndarray.get()`,
->        `info cuda kernels` "No CUDA kernels" → kernel 没完成
+>        `info cuda kernels` 显示 "No CUDA kernels" → **kernel 完全没完成**
 >     3. single launch `--q_shape 1,128,8,256 --k_shape 1,256,8,256 --is_persistent
->        --skip_ref_check` 也死锁, 排除 multi-round/KV cache state 问题
->     4. 死锁仅发生在 D=256 (num_d_chunks=2) + multi KV tile (loop_steps≥1)
->        组合; D=128 multi tile 通过, D=256 single tile 通过
->   - 当前 fix experiment: 在 5 个 active warp body 的 d_outer iter 末尾 加
->     **NamedBarrier(barrier_id=3, num_threads=480)** 强制同步, 排除/确认
->     "跨 d_outer 缺 sync" 是否为 root cause
->   - debug 开关已改为 env 变量: `FMHA_DEBUG_PIPELINE=1` 启用 cute.printf
->     trace; 当前 LOAD/MMA 在每个 d_outer 边界 / main loop phase 都有 trace。
+>        --skip_ref_check` 也 hang/被 OOM-killer killed, 排除 multi-round / KV cache
+>        reuse / cumulative seqlen state 问题
+>     4. **死锁仅发生在 D=256 (num_d_chunks=2) + multi KV tile (loop_steps≥1)** 组合:
+>        - D=128 + single tile ✓ | D=128 + multi tile ✓
+>        - D=256 + single tile ✓ | D=256 + multi tile ✗
+>   - **今日已 falsify 的 hypothesis**:
+>     - **(H1) 跨 d_outer 缺 CTA sync** — 加 `NamedBarrier(barrier_id=3,
+>       num_threads=480)` 在 5 个 active warp body 的 d_outer iter 末尾,
+>       D=128 回归仍 PASS, **D=256 Round 2 仍 hang** → falsified, 已回退
+>   - debug 开关: `FMHA_DEBUG_PIPELINE=1` 启用 cute.printf trace; 但 kernel hang 时
+>     printf 缓冲不 flush, 无输出。
 >
 > D-chunking 设计演进:
 >   - 原设计 (broken): PV inner d_chunk loop, 把多 chunk V 累加到同一个 tOtO0 →
@@ -217,9 +227,9 @@ correction final epilog 写 sO; epilogue 取 sO TMA store 到 gO[d_chunk_outer]�
 
 ---
 
-## 🔜 待办 — D=256 Round 2 死锁诊断
+## 🔜 待办 — D=256 Round 2 死锁诊断 (暂停, 下次继续)
 
-**当前现象** (Blackwell 真机上跑, 2026-05-23):
+### 当前现象 (Blackwell Thor 真机, 2026-05-23 22:00)
 
 ```
 python3 fmha/fmha.py --q_shape 1,128,8,256 --k_shape 1,128,8,256 --is_persistent
@@ -227,67 +237,171 @@ python3 fmha/fmha.py --q_shape 1,128,8,256 --k_shape 1,128,8,256 --is_persistent
 --- Round 1/3 (pos=0, s_k=128, cap=384) ---
   batch 0: PASS  max_diff=0.000612   ← Round 1 完美通过!
 --- Round 2/3 (pos=128, s_k=256, cap=384) ---
-  挂死 (无输出)
+  挂死 (无输出, ctrl+c 无响应)
 ```
 
-Round 1 走 0 个 main loop iter (单 KV tile, prologue+tail), 通过.
-Round 2 走 1 个 main loop iter (2 KV tiles), 挂死.
+Round 1 走 **0** 个 main loop iter (单 KV tile, prologue+tail), 通过。
+Round 2 走 **1** 个 main loop iter (2 KV tiles), 挂死。
 
-**已加诊断**:
-- `host/config.py`: `debug_pipeline` 改为 env-gated, 通过 `FMHA_DEBUG_PIPELINE=1` 启用.
-- `device/warp_mma.py`: main loop 每个 phase (QK0i / PV1 / QK1i / PV0i) 有
-  d_outer + iter idx + KV stage idx printf, tail 完成也有 printf.
-- `device/warp_load.py`: prologue + main iter 起头 / 每个 K/V acquire / d_outer
-  结束都有 printf.
+**对照试验**:
+| Config                              | num_d_chunks | loop_steps | 结果 |
+| ----------------------------------- | ------------ | ---------- | --- |
+| D=128, s_k=128                      | 1            | 0          | ✓   |
+| D=128, s_k=256+ (multi-round R2/R3) | 1            | ≥1         | ✓   |
+| D=256, s_k=128 (Round 1)            | 2            | 0          | ✓   |
+| D=256, s_k=256+ (Round 2)           | 2            | ≥1         | ✗ hang |
 
-**下一步**: 在 Blackwell 上跑以下命令, 把 trace 输出贴回来定位卡点:
+→ **死锁唯一条件**: `num_d_chunks > 1` **且** `loop_steps ≥ 1`。
+
+### 已 falsify 的 hypothesis
+
+#### (H1) 跨 d_outer 缺 CTA-wide sync — falsified (2026-05-23)
+
+**假设**: outer-loop 把 5 个 active warp 各自跨 `for d_chunk_outer` 推进, 但
+const_expr unroll 时 pipeline state 跨 d_outer iter carry 不一致, 需要在
+d_outer 边界强制全 warp 对齐。
+
+**实验**: 在 `host/config.py` 加 `d_outer_sync_barrier = NamedBarrier(
+barrier_id=3, num_threads=480)` (15 active warp × 32 thread, 排除 empty warp);
+在 5 个 warp body (load/mma/softmax×2/correction/epilogue) 的 `for d_chunk_outer`
+循环末尾加 `arrive_and_wait()`, 用 `const_expr(self.num_d_chunks > 1)` gate。
+
+**结果**:
+- 测试 1 D=128 回归: 3 轮 PASS, max_diff=0.0006 ✓ (确认 barrier 不破坏 D=128)
+- 测试 2 D=256 single launch (s_k=256): Compilation 完成后被 OOM-killer
+  `Killed` (host 端某次 alloc OOM, 跟死锁无直接关系)
+- 测试 3 D=256 multi-round Round 2: **仍 hang** ✗
+
+**结论**: cross-d_outer sync 不是 root cause。代码已回退 (commit 待打)。
+
+### 候选 hypothesis (下次继续优先排)
+
+#### (H2) PV `pv_whether_acc` 跨 d_outer 没正确 reset / carry — 重点怀疑
+
+`pv_whether_acc` 是 Python bool, 在 cutlass.range body 内被设 True 后 yield 回
+outer scope。每个 d_outer iter 起头我们 reset `pv_whether_acc = False`,
+但 **tail PV1 在 cutlass.range 出来后用的是 yield 出来的值** (True),
+这是对的 (tail PV1 应该 acc)。但 d_outer=1 的 PV00 起头 reset 为 False 时,
+Python 局部变量 `pv_whether_acc` 在 const_expr unroll 下是不是被正确处理?
+
+**验证方法**: 在 mma_warp_body 的 `pv_whether_acc = False` 重置点前后, 加
+`cute.printf("[d_outer=%d reset]", d_chunk_outer)` 看是否真的被执行。
+或直接把 `pv_whether_acc` 改为通过 `cutlass.const_expr` 包装的形式。
+
+#### (H3) `v_handle.release()` 跨 d_outer 漏一个或多一个
+
+每个 d_outer iter LOAD 产 (1 + loop_steps) 个 V; MMA 在 PV00 acquire 1 个 V
+(carry), 每个 main iter 内 PV1 release 旧 V + PV0i acquire 新 V, tail PV1
+release 最后一个 V。每 d_outer 共 acquire = (1 + loop_steps), release =
+(1 + loop_steps), 平衡。**但跨 d_outer 时, kv_pipeline 的 producer/consumer
+state.phase 是否在两端都同步 advance 了**?
+
+LOAD per d_outer: 产 num_d_chunks 个 K + 1 个 V (prologue) +
+loop_steps×(num_d_chunks K + 1 V) = num_d_chunks×(1+loop_steps) K +
+(1+loop_steps) V。
+MMA per d_outer wait: 对称数量。
+理论上 producer/consumer state.phase 应该一致。
+
+**验证方法**: 检查 `cute.printf` trace 在 LOAD/MMA 上的 K/V index, 看是否在
+d_outer=1 起头第一个 acquire 上卡住。
+**但 hang 时 printf 看不到 → 需要换写 GMEM counter 的方案** (见下)。
+
+#### (H4) `s1_handle` 跨 d_outer 时, tail 的 commit + d_outer=1 起头的 acquire 冲突
+
+tail PV1 末尾 `s0.commit(); s1.commit();` 把两个 s 还给 softmax。
+d_outer=1 起头 prologue acquire 新 s0/s1。这跨 d_outer 边界, 中间没有 mbar
+sync (除非 softmax 已 release)。如果 softmax 还没 release 上一轮的 s, 就 hang。
+
+**但 softmax 也有 d_outer loop**, 每 d_outer iter 它的 release 数应该匹配
+MMA 的 commit 数。除非 softmax 内的 d_outer loop 逻辑跟 MMA 不一致。
+
+**验证方法**: 跑 softmax warp 不带 d_outer loop (只跑一次) 看是否 hang
+减少, 但这会破坏正确性, 仅用于定位。
+
+#### (H5) `tOrVi` (V SMEM view) 跨 d_outer 没重新创建, 用了 stale view
+
+`tVgV_dkl[None, d_chunk_outer, ...]` 在每个 d_outer iter 起头重新切片, 但
+TMA copy 用的是 `tma_atom_v` (固定 descriptor)。如果 tma_atom_v 是按
+`pv_mma_tiler` (含 d=128) 创建的, 它处理任意 d_chunk_outer 偏移应该 OK
+(由 cute.copy 的 coord 参数决定)。但如果某处缓存了 d_outer=0 的 tOrVi 给
+d_outer=1 用就会错。
+
+### 下次继续的诊断 checklist
+
+#### 必做: 换"写 GMEM 计数器"代替 printf
+
+当前 `cute.printf` 在 kernel hang 时不 flush, 全无输出。改成:
+
+1. 在 `device/kernel.py` 起头 alloc 一个 device GMEM array (e.g., 64 × Int32),
+   每个 warp 一个 slot 记录最后到达的 phase index。
+2. 每个 warp body 的 d_outer/main loop 关键点, 用 `cute.copy` 或直接
+   `st.global` 写当前 (d_outer, iter, phase) 到自己的 slot。
+3. Host 端 launch 时不调 `.get()` 阻塞, 而是用 `cupy.cuda.Stream` polling +
+   timeout, 死锁 N 秒后强制 read GMEM array, 看每个 warp 卡在哪。
+
+或者更简单: kernel launch 一个 grid 后, **不等 stream sync**, 直接 background
+sleep + read GMEM counter (绕过 cuMemcpyDtoHAsync 的隐式 sync)。
+
+#### 备选: cuda-gdb 看 GPU warps
+
+用户已试过 `cuda-gdb`, 但 `info cuda kernels` 显示 "No CUDA kernels"。这意味着
+Ctrl+C 之前 driver 已经撤销了 kernel。换 attach 已 hang 的 Python (在另一终端):
 
 ```bash
-cd /path/to/study_cute
+# 终端 1
+python3 fmha/fmha.py --q_shape 1,128,8,256 --k_shape 1,128,8,256 --is_persistent
+# 死锁后保持
+
+# 终端 2
+sudo cuda-gdb -p $(pidof python3)
+(cuda-gdb) set pagination off
+(cuda-gdb) info cuda kernels     # 看是否能看到 launched kernel
+(cuda-gdb) info cuda warps
+(cuda-gdb) cuda warp 0
+(cuda-gdb) x/10i $pc-20          # 看 SASS, 找 BARRIER.* 或 WAIT
+```
+
+#### 备选: 对照原版 fmha (TensorRT-Edge-LLM/.../fmha.py)
+
+原版 `TensorRT-Edge-LLM/kernelSrcs/fmha_cutedsl_blackwell/fmha.py` 也是 D 维度
+不分 chunk (只支持 d ≤ 128 直接 single chunk)。**study_cute 的 d_outer loop
+是新增逻辑, 原版没有参考**。
+
+但原版有 d=256 实现 (mma_tiler_k=256 直接编)? 不, mma_tiler_k 受 tcgen05 限制
+只能 128。原版要支持 d=256 也必须 chunking, 但**原版可能没真的跑过 d=256**。
+
+**应优先**: 在原版 fmha 仓库里搜 `num_d_chunks` / `d_chunk_k` / 类似 D-chunking
+逻辑, 看是否有 reference impl。如果没有, 我们就是在做原创设计, debug 难度大。
+
+#### 备选: 用更小 shape 复现 / 简化
+
+试 `--q_shape 1,128,2,256 --k_shape 1,256,2,256 --skip_ref_check` (head_q=2
+缩小 grid), 看是否更易 attach / debug。
+
+### 当前代码状态 (本次会话结束时)
+
+- D=128 path (v3) ✓ 完整工作
+- D=256 outer-loop path: 单 KV tile (Round 1 / single launch s_k=128) ✓ 工作
+- D=256 + multi KV tile: ✗ hang (root cause 未定位)
+- H1 (cross-d_outer NamedBarrier) 实验代码已**回退**, repo 干净
+- printf trace 代码保留 (env gate `FMHA_DEBUG_PIPELINE=1`), 但 hang 时不 flush
+
+### 复现命令 (下次起手)
+
+```bash
+cd /codes/codes/study_cute
 rm -rf fmha/__pycache__ fmha/host/__pycache__ fmha/device/__pycache__
 
-FMHA_DEBUG_PIPELINE=1 FMHA_DEBUG_ROUNDS=2 \
-  python3 fmha/fmha.py --q_shape 1,128,8,256 --k_shape 1,128,8,256 \
-  --is_persistent 2>&1 | tee /tmp/fmha_d256_trace.log
-# 死锁后 Ctrl+C, 看 /tmp/fmha_d256_trace.log 的最后输出.
-# 重点看 Round 2 期间最后一条 trace: LOAD 卡在哪个 K/V acquire? MMA 卡在 PV1/PV0i?
-```
-
-**其他诊断命令** (Blackwell 上仍可跑的回归):
-
-```bash
-# ① D=128 回归: 确认 outer-loop 路径在 num_d_chunks=1 退化时仍 PASS
+# D=128 回归 (~1.1ms, 应 PASS):
 python3 fmha/fmha.py --q_shape 1,256,8,128 --k_shape 1,256,8,128 --is_persistent
-# 预期: 3 轮 prefill PASS, max_diff < 0.1
 
-# ③ 如有需要, 单 KV tile / 多 KV tile + skip ref:
-python3 fmha/fmha.py --q_shape 1,128,8,256 --k_shape 1,128,8,256 \
+# D=256 multi-round (Round 2 hang):
+python3 fmha/fmha.py --q_shape 1,128,8,256 --k_shape 1,128,8,256 --is_persistent
+
+# D=256 single launch multi KV tile (也 hang / OOM-killed):
+python3 fmha/fmha.py --q_shape 1,128,8,256 --k_shape 1,256,8,256 \
   --is_persistent --skip_ref_check
-python3 fmha/fmha.py --q_shape 1,256,8,256 --k_shape 1,256,8,256 \
-  --is_persistent --skip_ref_check
 ```
-
-### 如果死锁
-
-打开 trace 看 LOAD/MMA 在哪个 V slot 卡住:
-```python
-# fmha/host/config.py:
-debug_pipeline = True
-```
-然后看 stderr 上的 `LOAD prologue d_outer=X kv=...` 和 `MMA prologue
-d_outer=X trip=...` 序列在哪一步停下来。
-
-### 如果 ref check FAIL
-
-可以用 `FMHA_DEBUG_DCHUNK=1` 看每个 d_chunk_outer 的 actual vs ref:
-
-```bash
-FMHA_DEBUG_DCHUNK=1 FMHA_DEBUG_ROUNDS=1 python3 fmha/fmha.py \
-  --q_shape 1,128,8,256 --k_shape 1,128,8,256 --is_persistent
-```
-
-期望: 每个 d_chunk 的 actual 与 ref 相近 (max_diff < 0.1), 且不同 d_chunk 的
-actual 应该**不同** (验证 V[d_chunk_outer] 切片正确生效)。
 
 ---
 
@@ -309,5 +423,7 @@ actual 应该**不同** (验证 V[d_chunk_outer] 切片正确生效)。
 | runner            | ✅           |
 | regression-d128   | ✅           |
 | d256-trace        | ✅           |
-| **fix-v-release** | ✅ (今天完成) |
-| **validate-d256** | 🟡 等 Blackwell 真机 |
+| fix-v-release     | ✅           |
+| d256-outer-loop-impl | ✅        |
+| h1-cross-d_outer-barrier | ❌ falsified, 已回退 |
+| **validate-d256** | 🟡 暂停 — Round 2 hang root cause 未定位 |

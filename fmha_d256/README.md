@@ -13,8 +13,14 @@ study_cute 仓库下,方便在 Jetson Thor (sm_100a) 上跑 head_dim=256 的 FMH
 | `fmha_d256.py` | study_cute 自写的轻量 CLI shim |
 | `__init__.py` | study_cute 自写,空 (使 `fmha_d256` 变成 Python package) |
 
-`mixed_input_fmha_prefill_d256.py` 只改了两行 import (line 48-58),其余 100%
-与官方一致,便于后续 follow upstream。
+`mixed_input_fmha_prefill_d256.py` 改动很小,只是为了兼容 Thor 的 DSL 版本:
+
+| Change | Line | Why |
+| --- | --- | --- |
+| Import rewrites (`from helpers import ...` → `from fmha_d256 import ...`) | 48-58 | Repo layout 适配 |
+| 去掉 `storage.tmem_holding_buf.ptr` / `storage.tmem_dealloc_mbar.ptr` 的 `.ptr` | 666 / 670 | Thor 上 DSL (`nvidia-cutlass-dsl` <= 4.4.2) 中 `storage.<scalar_field>` 已经直接返回 `_Pointer`, 没有 `.ptr` 属性 (新 DSL 才加上的 wrapper) |
+
+其余 100% 与官方一致,便于后续 follow upstream。
 
 ## 接口契约
 
@@ -76,6 +82,20 @@ python3 fmha_d256/fmha_d256.py \
 # (5) 完整 CLI 选项
 python3 fmha_d256/fmha_d256.py --help
 ```
+
+### 已知 Thor 兼容性修复
+
+如果你 pull 了最新 CUTLASS upstream 又遇到下面这种报错:
+
+```
+AttributeError: '_Pointer' object has no attribute 'ptr'
+  File ".../mixed_input_fmha_prefill_d256.py", line 666, in kernel
+    storage.tmem_holding_buf.ptr,
+```
+
+说明你引入了新版 DSL 写法。修复:**去掉 line 666 和 line 670 的 `.ptr`**
+(`storage.tmem_holding_buf` 在 Thor DSL 里已经是 Pointer 类型),见上面"文件
+来源"表格里的 patch 说明。
 
 ## 本地非 Blackwell GPU 上的限制
 

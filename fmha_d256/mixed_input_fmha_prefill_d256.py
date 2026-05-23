@@ -662,12 +662,17 @@ class MixedInputFusedMultiHeadAttentionPrefillD256:
             ),
         )
         # Tensor memory dealloc barrier init
+        # NOTE: Thor's DSL version (<= 4.4.2) returns a `_Pointer` directly when
+        # accessing a scalar struct field (e.g. `storage.tmem_holding_buf`), so
+        # the `.ptr` attribute introduced in newer DSL releases does not exist.
+        # Dropping `.ptr` works for both old and new variants because the value
+        # is already a Pointer the moment we read the struct field.
         tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf.ptr,
+            storage.tmem_holding_buf,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.correction_warp_ids[0],
             is_two_cta=True,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar,
         )
         # Cluster arrive after barrier init
         pipeline_init_arrive(cluster_shape_mn=cluster_layout_vmnk, is_relaxed=True)

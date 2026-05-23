@@ -109,6 +109,43 @@ python3 fmha_d256/fmha_d256.py \
 python3 fmha_d256/fmha_d256.py --help
 ```
 
+### 一键 sweep (bench_sweep.sh)
+
+跑一组 shape 矩阵,自动解析 + 输出 CSV + 终端 markdown 表格:
+
+```bash
+cd <study_cute root>
+
+# (1) 默认 8 个 case (B/H_q/S/causal 覆盖核心场景)
+bash fmha_d256/bench_sweep.sh
+
+# (2) 快速 smoke (3 个 case)
+bash fmha_d256/bench_sweep.sh --quick
+
+# (3) 完整 16 个 case (大 sweep, ~20 分钟)
+bash fmha_d256/bench_sweep.sh --full
+
+# (4) 跳过 ref check, 跑快一点
+bash fmha_d256/bench_sweep.sh --no-ref-check
+
+# (5) 自定义 timing
+bash fmha_d256/bench_sweep.sh --warmup 50 --iters 500
+
+# (6) 自定义输出 + per-case timeout
+bash fmha_d256/bench_sweep.sh --out /tmp/perf.csv --timeout 300
+```
+
+输出 CSV 列:`case_id,B,H_q,H_k,S_q,S_k,D,is_causal,is_persistent,warmup,iters,latency_us,tflops,io_bw_gbps,status`
+
+`status` 可能取值:
+- `PASS` — kernel 跑通 + (启用时) torch ref 对拍通过
+- `REF_FAIL` — kernel 跑通但精度不达 atol
+- `FAIL_TIMEOUT` — 超时 (默认 180s),通常是死锁
+- `FAIL_rc=N` — Python 异常 (CUDA error, OOM, etc.)
+- `FAIL_no_summary` / `FAIL_parse` — 输出格式不对 (升级 shim 后可能出现)
+
+Sweep 跑完后终端会直接 print 一张 markdown 表格,可以直接 paste 到 PR / 文档里。
+
 ### Benchmark 输出格式
 
 带默认 `--iterations >= 1` 时,会打印两行 perf summary:

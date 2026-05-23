@@ -14,3 +14,7 @@ dist/
 .vscode/
 .idea/
 *.swp
+
+# Benchmark sweep outputs
+fmha_d256/bench_sweep*.csv
+*.bench.csv

@@ -54,11 +54,25 @@ loop (cumulative seqlen + packed cache),需要后续做接口适配 — 见底�
 3. **Mixed-input 量化**: 8 个 `transform_warp` 专门做 i8→bf16 dequant; 通过
    独立的 `dequant_kv` pipeline 把转换后的 K/V 喂给 MMA warp
 
-## 在 Jetson Thor (Blackwell sm_100a) 上的运行命令
+## 在 Jetson Thor (Blackwell, compute capability 11.0) 上的运行命令
+
+> ⚠️ **Thor 的 GPU 实际 arch 是 `sm_110`,不是 `sm_100a`**。CUTLASS DSL 默认
+> 不认识 (11, 0) 这个 CC,会 fall through 到 `sm_{major}{minor}` ⇒ `sm_110`。
+> 如果你用 `CUTE_DSL_ARCH=sm_100a` 编译,launch 时会报
+> `cudaErrorNoKernelImageForDevice (209)` — 这是真实的 ISA 不兼容,不是 bug。
+>
+> shim 已经内置 *auto-detect*:不设环境变量时,会自动用本地 GPU 的 CC 推出
+> `sm_110a` / `sm_100a` / `sm_89` 等。**Thor 上推荐做法是直接什么都不设**,
+> 让 shim 自己探测;或者显式 `export CUTE_DSL_ARCH=sm_110`。
 
 ```bash
 cd <study_cute root>
-export CUTE_DSL_ARCH=sm_100a    # 关键: 必须显式指定 Blackwell arch
+
+# (推荐) 让 shim 自动探测 GPU 并 set CUTE_DSL_ARCH
+unset CUTE_DSL_ARCH
+
+# (备选) 显式指定 — Thor 上是 sm_110 (不带 a 后缀); B200 上才用 sm_100a
+# export CUTE_DSL_ARCH=sm_110
 
 # (1) 基础 smoke test (无 ref check, 最快验证 kernel 能跑通; 不 benchmark)
 python3 fmha_d256/fmha_d256.py \

@@ -35,6 +35,83 @@ import sys
 _CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_CURRENT_DIR))
 
+
+def _auto_set_cute_dsl_arch() -> str:
+    """Detect the local GPU compute capability and set CUTE_DSL_ARCH.
+
+    The CUTLASS DSL compiles the kernel for the arch given in the
+    ``CUTE_DSL_ARCH`` env var, then launches on the current GPU. If the two
+    don't match, the launch fails with cudaErrorNoKernelImageForDevice (209).
+
+    On Jetson Thor the GPU reports compute capability (11, 0) which the DSL
+    spells ``sm_110``; on a B200 it's ``sm_100a``. Hard-coding ``sm_100a``
+    works for B200 only.
+
+    This helper:
+        * respects an explicit user override (env var already set);
+        * otherwise queries the active CUDA device via the CUDA driver and
+          sets a sensible value (Blackwell-family GPUs => ``sm_<MAJOR><MINOR>a``).
+
+    Must be called BEFORE ``import cutlass`` (the DSL caches the value at
+    import time).
+    """
+    user_override = os.environ.get("CUTE_DSL_ARCH")
+    if user_override:
+        print(f"[fmha_d256] using user-specified CUTE_DSL_ARCH={user_override}")
+        return user_override
+    def _last(ret):
+        """cuda-python returns either (err, value) or (err,); normalize to last element."""
+        if isinstance(ret, tuple):
+            return ret[-1] if len(ret) > 1 else None
+        return ret
+
+    try:
+        import cuda.bindings.driver as cuda
+
+        _last(cuda.cuInit(0))
+        dev = _last(cuda.cuDeviceGet(0))
+        attr = cuda.CUdevice_attribute
+        major = _last(
+            cuda.cuDeviceGetAttribute(
+                attr.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev
+            )
+        )
+        minor = _last(
+            cuda.cuDeviceGetAttribute(
+                attr.CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev
+            )
+        )
+        if major is None or minor is None:
+            raise RuntimeError("cuDeviceGetAttribute returned no value")
+        major = int(major)
+        minor = int(minor)
+    except Exception as e:
+        # Fall back to sm_100a (B200 default). User can still override.
+        fallback = "sm_100a"
+        print(
+            f"[fmha_d256] WARNING: could not auto-detect GPU arch ({e}); "
+            f"falling back to CUTE_DSL_ARCH={fallback}"
+        )
+        os.environ["CUTE_DSL_ARCH"] = fallback
+        return fallback
+    # Blackwell family => append the 'a' suffix the DSL expects for
+    # arch-specific tcgen05.* instructions. Older arches fall through to plain
+    # sm_<MM>.
+    if major >= 10:
+        arch = f"sm_{major}{minor}a"
+    else:
+        arch = f"sm_{major}{minor}"
+    os.environ["CUTE_DSL_ARCH"] = arch
+    print(
+        f"[fmha_d256] auto-detected GPU CC ({major}, {minor}) -> "
+        f"CUTE_DSL_ARCH={arch}"
+    )
+    return arch
+
+
+_AUTO_ARCH = _auto_set_cute_dsl_arch()
+
+
 import torch
 
 import cutlass

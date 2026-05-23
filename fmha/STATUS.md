@@ -1,10 +1,21 @@
 # FMHA 重构 + D=256 死锁修复 — 进度快照
 
-> 最后更新: 2026-05-23 (Saturday) ~01:15 UTC+8
+> 最后更新: 2026-05-23 (Saturday) ~22:30 UTC+8
 > 状态:
 >   - **D=128**: 完全通过 (v3 修复 deadlock + 精度, prefill 3 轮 PASS, max_diff=0.0006)
 >   - **D=256 outer-loop**: Round 1 **PASS** (max_diff=0.000612, 单 KV tile),
->     **Round 2 死锁** (1 个 main loop iter)。需要 trace 定位卡点。
+>     **Round 2 死锁** (multi KV tile, loop_steps≥1)。
+>   - 诊断结论:
+>     1. `dmesg` 没有 nvidia/xid/gpu fault, 排除硬件错误 (Thor 用 nvgpu 驱动框架)
+>     2. `cuda-gdb` host 栈 stuck 在 `ioctl/cuMemcpyDtoHAsync_v2/cupy.ndarray.get()`,
+>        `info cuda kernels` "No CUDA kernels" → kernel 没完成
+>     3. single launch `--q_shape 1,128,8,256 --k_shape 1,256,8,256 --is_persistent
+>        --skip_ref_check` 也死锁, 排除 multi-round/KV cache state 问题
+>     4. 死锁仅发生在 D=256 (num_d_chunks=2) + multi KV tile (loop_steps≥1)
+>        组合; D=128 multi tile 通过, D=256 single tile 通过
+>   - 当前 fix experiment: 在 5 个 active warp body 的 d_outer iter 末尾 加
+>     **NamedBarrier(barrier_id=3, num_threads=480)** 强制同步, 排除/确认
+>     "跨 d_outer 缺 sync" 是否为 root cause
 >   - debug 开关已改为 env 变量: `FMHA_DEBUG_PIPELINE=1` 启用 cute.printf
 >     trace; 当前 LOAD/MMA 在每个 d_outer 边界 / main loop phase 都有 trace。
 >

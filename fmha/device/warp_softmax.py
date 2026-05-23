@@ -513,6 +513,9 @@ def softmax(
                 vec_i_handle.commit()
                 si_corr_producer.acquire()
                 si_handle.release()
+                # Cross-d_outer sync (only required for num_d_chunks > 1).
+                if cutlass.const_expr(self.num_d_chunks > 1):
+                    self.d_outer_sync_barrier.arrive_and_wait()
             # End of d_chunk_outer loop
 
         tile_sched.advance_to_next_work()

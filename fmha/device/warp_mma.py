@@ -388,6 +388,10 @@ def mma_warp_body(
                         "MMA d_outer=%d tail done (s0/s1 committed)\n",
                         d_chunk_outer,
                     )
+                # Cross-d_outer sync: forces all active warps to align before
+                # next d_outer iter. Only required for num_d_chunks > 1.
+                if cutlass.const_expr(self.num_d_chunks > 1):
+                    self.d_outer_sync_barrier.arrive_and_wait()
             # End of d_chunk_outer loop
 
         # Advance to next tile

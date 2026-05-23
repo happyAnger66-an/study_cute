@@ -301,6 +301,9 @@ def load_warp_body(
                         "LOAD d_outer=%d done (kv loop end)\n",
                         d_chunk_outer,
                     )
+                # Cross-d_outer sync (only required for num_d_chunks > 1).
+                if cutlass.const_expr(self.num_d_chunks > 1):
+                    self.d_outer_sync_barrier.arrive_and_wait()
 
         tile_sched.advance_to_next_work()
         work_tile = tile_sched.get_current_work()

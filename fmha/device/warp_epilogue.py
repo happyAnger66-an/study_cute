@@ -100,6 +100,9 @@ def epilogue_warp_body(
                 o0_handle.release()
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
                 o1_handle.release()
+                # Cross-d_outer sync (only required for num_d_chunks > 1).
+                if cutlass.const_expr(self.num_d_chunks > 1):
+                    self.d_outer_sync_barrier.arrive_and_wait()
 
         tile_sched.advance_to_next_work()
         work_tile = tile_sched.get_current_work()

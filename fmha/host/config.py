@@ -124,6 +124,24 @@ class BlackwellFusedMultiHeadAttentionForward:
             barrier_id=2,
             num_threads=self.threads_per_warp,
         )
+        # D-chunk outer barrier: forces all 5 active warp groups (load, mma,
+        # softmax0, softmax1, correction, epilogue) to align at every
+        # d_chunk_outer iter boundary, so cross-d_outer pipeline state stays
+        # consistent. Excludes the empty warp (which exits early after
+        # setmaxregister).
+        # 15 active warps * 32 threads = 480 threads.
+        self.d_outer_active_warps = (
+            1                                   # load
+            + 1                                 # mma
+            + 1                                 # epilogue
+            + len(self.softmax0_warp_ids)
+            + len(self.softmax1_warp_ids)
+            + len(self.correction_warp_ids)
+        )
+        self.d_outer_sync_barrier = pipeline.NamedBarrier(
+            barrier_id=3,
+            num_threads=self.threads_per_warp * self.d_outer_active_warps,
+        )
 
         # TMEM map (column offsets; QK S is 128 wide, PV O is D_chunk_k wide)
         self.tmem_s0_offset = 0

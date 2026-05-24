@@ -47,15 +47,17 @@ def load_qk(
     else:
         tQgQ, tQsQ, tma_atom_q, load_q_producer = None, None, None, None
     tKgK, tKsK, tma_atom_k, load_k_producer = k_args
-    tKgScaleK, tKsScaleK, tma_atom_scale_k, load_scale_k_producer = scale_k_args
-
-    scale_k_handle = load_scale_k_producer.acquire_and_advance()
-    cute.copy(
-        tma_atom_scale_k,
-        tKgScaleK[None, kv_step],
-        tKsScaleK[None, scale_k_handle.index],
-        tma_bar_ptr=scale_k_handle.barrier,
-    )
+    if cutlass.const_expr(scale_k_args is not None):
+        tKgScaleK, tKsScaleK, tma_atom_scale_k, load_scale_k_producer = scale_k_args
+        scale_k_handle = load_scale_k_producer.acquire_and_advance()
+        cute.copy(
+            tma_atom_scale_k,
+            tKgScaleK[None, kv_step],
+            tKsScaleK[None, scale_k_handle.index],
+            tma_bar_ptr=scale_k_handle.barrier,
+        )
+    else:
+        load_scale_k_producer = None
     for iter in cutlass.range(iterations, unroll=1):
         if cutlass.const_expr(q_args is not None):
             q_handle = load_q_producer.acquire_and_advance()
@@ -83,17 +85,20 @@ def load_v(
     iterations: int,
     kv_step: cutlass.Int32,
     v_args: Tuple,
-    scale_v_args: Tuple,
+    scale_v_args: Optional[Tuple] = None,
 ) -> pipeline.PipelineProducer:
     tVgV, tVsV, tma_atom_v, load_v_producer = v_args
-    tScaleVgV, tScaleVsV, tma_atom_scale_v, load_scale_v_producer = scale_v_args
-    scale_v_handle = load_scale_v_producer.acquire_and_advance()
-    cute.copy(
-        tma_atom_scale_v,
-        tScaleVgV[None, kv_step],
-        tScaleVsV[None, scale_v_handle.index],
-        tma_bar_ptr=scale_v_handle.barrier,
-    )
+    if cutlass.const_expr(scale_v_args is not None):
+        tScaleVgV, tScaleVsV, tma_atom_scale_v, load_scale_v_producer = scale_v_args
+        scale_v_handle = load_scale_v_producer.acquire_and_advance()
+        cute.copy(
+            tma_atom_scale_v,
+            tScaleVgV[None, kv_step],
+            tScaleVsV[None, scale_v_handle.index],
+            tma_bar_ptr=scale_v_handle.barrier,
+        )
+    else:
+        load_scale_v_producer = None
     for iter in cutlass.range(iterations, unroll=1):
         v_handle = load_v_producer.acquire_and_advance()
         cute.copy(
@@ -103,6 +108,170 @@ def load_v(
             tma_bar_ptr=v_handle.barrier,
         )
     return load_v_producer, load_scale_v_producer
+
+
+@cute.jit
+def transform_k(
+    iterations: int,
+    transform_warp_ids: Tuple,
+    dtype_args: Tuple,
+    tensor_args: Tuple,
+    pipeline_args: Tuple,
+):
+    """Layout transform K staging -> K_trans (homogeneous dtype, no dequant)."""
+    (kv_dtype, q_dtype) = dtype_args
+    (sOrig, sTrans) = tensor_args
+    (load_kv_consumer, transform_kv_producer) = pipeline_args
+    tidx, _, _ = cute.arch.thread_idx()
+    THREADS_PER_WARP = 32
+    thread_idx = tidx % (THREADS_PER_WARP * len(transform_warp_ids))
+    r2s_copy_atom = cute.make_copy_atom(
+        cute.nvgpu.CopyUniversalOp(), kv_dtype, num_bits_per_copy=32
+    )
+    r2s_tiled_copy = cute.make_cotiled_copy(
+        r2s_copy_atom,
+        cute.make_layout((256, 16), stride=(16, 1)),
+        sTrans[(None, None, None, 0)].layout,
+    )
+    thr_r2s_tiled_copy = r2s_tiled_copy.get_slice(thread_idx)
+    tOsOrig = thr_r2s_tiled_copy.partition_S(sOrig)
+    tTsTrans = thr_r2s_tiled_copy.partition_D(sTrans)
+    tOrOrig = cute.make_rmem_tensor_like(
+        cute.append(
+            tOsOrig[None, None, None, None, 0].layout,
+            cute.make_layout(
+                2, stride=cute.cosize(tOsOrig[None, None, None, None, 0].layout)
+            ),
+        ),
+        kv_dtype,
+    )
+    tTrTrans = cute.make_rmem_tensor_like(
+        cute.append(
+            tTsTrans[None, None, None, None, 0].layout,
+            cute.make_layout(
+                2, stride=cute.cosize(tTsTrans[None, None, None, None, 0].layout)
+            ),
+        ),
+        q_dtype,
+    )
+    kv_handle = load_kv_consumer.wait_and_advance()
+    cute.autovec_copy(
+        tOsOrig[None, None, None, None, kv_handle.index],
+        tOrOrig[None, None, None, None, 0],
+    )
+    transformed_tensor = tOrOrig[None, None, None, None, 0].load().to(q_dtype)
+    tTrTrans[None, None, None, None, 0].store(transformed_tensor)
+    cute.arch.fence_view_async_shared()
+    kv_handle.release()
+    for iter in cutlass.range(1, iterations, unroll_full=True):
+        kv_trans_handle = transform_kv_producer.acquire_and_advance()
+        cute.autovec_copy(
+            tTrTrans[None, None, None, None, (iter - 1) % 2],
+            tTsTrans[None, None, None, None, kv_trans_handle.index],
+        )
+        cute.arch.fence_view_async_shared()
+        kv_trans_handle.commit()
+        kv_handle = load_kv_consumer.wait_and_advance()
+        cute.autovec_copy(
+            tOsOrig[None, None, None, None, kv_handle.index],
+            tOrOrig[None, None, None, None, iter % 2],
+        )
+        transformed_tensor = (
+            tOrOrig[None, None, None, None, iter % 2].load().to(q_dtype)
+        )
+        tTrTrans[None, None, None, None, iter % 2].store(transformed_tensor)
+        cute.arch.fence_view_async_shared()
+        kv_handle.release()
+    kv_trans_handle = transform_kv_producer.acquire_and_advance()
+    cute.autovec_copy(
+        tTrTrans[None, None, None, None, (iterations - 1) % 2],
+        tTsTrans[None, None, None, None, kv_trans_handle.index],
+    )
+    cute.arch.fence_view_async_shared()
+    kv_trans_handle.commit()
+    return load_kv_consumer, transform_kv_producer
+
+
+@cute.jit
+def transform_v(
+    iterations: int,
+    transform_warp_ids: Tuple,
+    dtype_args: Tuple,
+    tensor_args: Tuple,
+    pipeline_args: Tuple,
+):
+    """Layout transform V staging -> V_trans (homogeneous dtype, no dequant)."""
+    (v_dtype, q_dtype) = dtype_args
+    (sOrig, sTrans) = tensor_args
+    (load_kv_consumer, transform_kv_producer) = pipeline_args
+    tidx, _, _ = cute.arch.thread_idx()
+    THREADS_PER_WARP = 32
+    thread_idx = tidx % (THREADS_PER_WARP * len(transform_warp_ids))
+    r2s_copy_atom = cute.make_copy_atom(
+        cute.nvgpu.CopyUniversalOp(), v_dtype, num_bits_per_copy=32
+    )
+    r2s_tiled_copy = cute.make_cotiled_copy(
+        r2s_copy_atom,
+        cute.make_layout((256, 16), stride=(16, 1)),
+        sTrans[(None, None, None, 0)].layout,
+    )
+    thr_r2s_tiled_copy = r2s_tiled_copy.get_slice(thread_idx)
+    tOsOrig = thr_r2s_tiled_copy.partition_S(sOrig)
+    tTsTrans = thr_r2s_tiled_copy.partition_D(sTrans)
+    tOrOrig = cute.make_rmem_tensor_like(
+        cute.append(
+            tOsOrig[None, None, None, None, 0].layout,
+            cute.make_layout(
+                2, stride=cute.cosize(tOsOrig[None, None, None, None, 0].layout)
+            ),
+        ),
+        v_dtype,
+    )
+    tTrTrans = cute.make_rmem_tensor_like(
+        cute.append(
+            tTsTrans[None, None, None, None, 0].layout,
+            cute.make_layout(
+                2, stride=cute.cosize(tTsTrans[None, None, None, None, 0].layout)
+            ),
+        ),
+        q_dtype,
+    )
+    kv_handle = load_kv_consumer.wait_and_advance()
+    cute.autovec_copy(
+        tOsOrig[None, None, None, None, kv_handle.index],
+        tOrOrig[None, None, None, None, 0],
+    )
+    transformed_tensor = tOrOrig[None, None, None, None, 0].load().to(q_dtype)
+    tTrTrans[None, None, None, None, 0].store(transformed_tensor)
+    cute.arch.fence_view_async_shared()
+    kv_handle.release()
+    for iter in cutlass.range(1, iterations, unroll_full=True):
+        kv_trans_handle = transform_kv_producer.acquire_and_advance()
+        cute.autovec_copy(
+            tTrTrans[None, None, None, None, (iter - 1) % 2],
+            tTsTrans[None, None, None, None, kv_trans_handle.index],
+        )
+        cute.arch.fence_view_async_shared()
+        kv_trans_handle.commit()
+        kv_handle = load_kv_consumer.wait_and_advance()
+        cute.autovec_copy(
+            tOsOrig[None, None, None, None, kv_handle.index],
+            tOrOrig[None, None, None, None, iter % 2],
+        )
+        transformed_tensor = (
+            tOrOrig[None, None, None, None, iter % 2].load().to(q_dtype)
+        )
+        tTrTrans[None, None, None, None, iter % 2].store(transformed_tensor)
+        cute.arch.fence_view_async_shared()
+        kv_handle.release()
+    kv_trans_handle = transform_kv_producer.acquire_and_advance()
+    cute.autovec_copy(
+        tTrTrans[None, None, None, None, (iterations - 1) % 2],
+        tTsTrans[None, None, None, None, kv_trans_handle.index],
+    )
+    cute.arch.fence_view_async_shared()
+    kv_trans_handle.commit()
+    return load_kv_consumer, transform_kv_producer
 
 
 @cute.jit

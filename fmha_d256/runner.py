@@ -25,21 +25,42 @@
 # CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-"""Test driver / benchmark entry for d=256 mixed-input FMHA."""
+"""Test driver / benchmark entry for d=256 FMHA (mixed-input and homogeneous)."""
 
 import math
+import os
+import time
 from typing import Tuple, Type
 
+import cupy as cp
+import numpy as np
 import torch
 
+import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.typing import Float32, Int32
 from cutlass.cute import testing as cute_testing
+from cutlass.cute.runtime import from_dlpack
 
 from fmha_d256 import fmha_helpers as fmha_utils
 from fmha_d256.host.config import MixedInputFusedMultiHeadAttentionPrefillD256
-from fmha_d256.host.torch_ref import create_tensor, run_torch_fmha
+from fmha_d256.host.tensor_layout import (
+    mark_1d_dynamic,
+    mark_bshd_dynamic,
+    mark_kv_cache_dynamic,
+)
+from fmha_d256.host.torch_ref import (
+    create_tensor,
+    run_torch_fmha,
+    run_torch_fmha_homo,
+)
+
+
+def _numpy_softmax(x, axis=-1):
+    x_max = np.max(x, axis=axis, keepdims=True)
+    exp_x = np.exp(x - x_max)
+    return exp_x / np.sum(exp_x, axis=axis, keepdims=True)
 
 
 def run(
@@ -120,14 +141,18 @@ def run(
     if isinstance(s_k, tuple) and len(s_k) != b:
         raise ValueError("variable_seqlen s_k must have the length of batch size")
 
-    if q_dtype not in {cutlass.BFloat16}:
-        raise ValueError("in_dtype must be BFloat16")
+    if q_dtype not in {cutlass.BFloat16, cutlass.Float16}:
+        raise ValueError("q_dtype must be BFloat16 or Float16")
 
     if o_dtype not in {cutlass.BFloat16}:
         raise ValueError("o_dtype must be BFloat16")
 
-    if kv_dtype not in {cutlass.Int8}:
-        raise ValueError("kv_dtype must be Int8")
+    if kv_dtype not in {cutlass.Int8, cutlass.BFloat16, cutlass.Float16}:
+        raise ValueError("kv_dtype must be Int8, BFloat16, or Float16")
+
+    is_mixed_input = kv_dtype == cutlass.Int8
+    if not is_mixed_input and kv_dtype != q_dtype:
+        raise ValueError("homogeneous path requires kv_dtype == q_dtype")
 
     if qk_acc_dtype not in {cutlass.Float32}:
         raise ValueError("qk_acc_dtype must be Float32")
@@ -148,8 +173,15 @@ def run(
     k_ref, k_tensor, k_torch = create_tensor(k_shape, kv_dtype)
     v_ref, v_tensor, v_torch = create_tensor(k_shape, kv_dtype)
     o_ref, o_tensor, o_torch = create_tensor(q_shape, o_dtype)
-    scale_k_ref, scale_k_tensor, scale_k_torch = create_tensor(scale_shape, scale_dtype)
-    scale_v_ref, scale_v_tensor, scale_v_torch = create_tensor(scale_shape, scale_dtype)
+    scale_k_ref = scale_k_tensor = scale_k_torch = None
+    scale_v_ref = scale_v_tensor = scale_v_torch = None
+    if is_mixed_input:
+        scale_k_ref, scale_k_tensor, scale_k_torch = create_tensor(
+            scale_shape, scale_dtype
+        )
+        scale_v_ref, scale_v_tensor, scale_v_torch = create_tensor(
+            scale_shape, scale_dtype
+        )
 
     mask_type = fmha_utils.MaskEnum.WINDOW_MASK_INFERENCE
     if is_causal:
@@ -164,6 +196,7 @@ def run(
         pv_acc_dtype,
         is_persistent,
         mask_type,
+        is_mixed_input=is_mixed_input,
     )
 
     # Initialize Stream
@@ -179,25 +212,9 @@ def run(
     scale_softmax_log2 = scale_softmax * log2_e
     scale_output = scale_v * inv_scale_o
     problem_size = (b, s_q, s_k, h_q, h_k, d)
-    compiled_fmha = cute.compile(
-        fmha,
-        q_tensor.iterator,
-        k_tensor.iterator,
-        v_tensor.iterator,
-        o_tensor.iterator,
-        scale_k_tensor.iterator,
-        scale_v_tensor.iterator,
-        problem_size,
-        scale_softmax_log2,
-        scale_output,
-        window_size_left if window_size_left is None else Int32(window_size_left),
-        window_size_right if window_size_right is None else Int32(window_size_right),
-        current_stream,
-        options=f"--opt-level 2",
-    )
-    if not skip_ref_check:
-        # Execute kernel once for reference checking
-        compiled_fmha(
+    if is_mixed_input:
+        compiled_fmha = cute.compile(
+            fmha,
             q_tensor.iterator,
             k_tensor.iterator,
             v_tensor.iterator,
@@ -214,18 +231,87 @@ def run(
                 else Int32(window_size_right)
             ),
             current_stream,
+            options="--opt-level 2",
         )
-        print("Verifying results...")
-        o_ref = run_torch_fmha(
-            q_ref,
-            k_ref,
-            v_ref,
-            scale_k_ref,
-            scale_v_ref,
-            scale_softmax,
+    else:
+        compiled_fmha = cute.compile(
+            fmha.launch_homo,
+            q_tensor.iterator,
+            k_tensor.iterator,
+            v_tensor.iterator,
+            o_tensor.iterator,
+            problem_size,
+            scale_softmax_log2,
             scale_output,
-            is_causal,
+            window_size_left if window_size_left is None else Int32(window_size_left),
+            (
+                window_size_right
+                if window_size_right is None
+                else Int32(window_size_right)
+            ),
+            current_stream,
+            None,
+            options="--opt-level 2",
         )
+    if not skip_ref_check:
+        if is_mixed_input:
+            compiled_fmha(
+                q_tensor.iterator,
+                k_tensor.iterator,
+                v_tensor.iterator,
+                o_tensor.iterator,
+                scale_k_tensor.iterator,
+                scale_v_tensor.iterator,
+                problem_size,
+                scale_softmax_log2,
+                scale_output,
+                window_size_left if window_size_left is None else Int32(window_size_left),
+                (
+                    window_size_right
+                    if window_size_right is None
+                    else Int32(window_size_right)
+                ),
+                current_stream,
+            )
+        else:
+            compiled_fmha(
+                q_tensor.iterator,
+                k_tensor.iterator,
+                v_tensor.iterator,
+                o_tensor.iterator,
+                problem_size,
+                scale_softmax_log2,
+                scale_output,
+                window_size_left if window_size_left is None else Int32(window_size_left),
+                (
+                    window_size_right
+                    if window_size_right is None
+                    else Int32(window_size_right)
+                ),
+                current_stream,
+                None,
+            )
+        print("Verifying results...")
+        if is_mixed_input:
+            o_ref = run_torch_fmha(
+                q_ref,
+                k_ref,
+                v_ref,
+                scale_k_ref,
+                scale_v_ref,
+                scale_softmax,
+                scale_output,
+                is_causal,
+            )
+        else:
+            o_ref = run_torch_fmha_homo(
+                q_ref,
+                k_ref,
+                v_ref,
+                scale_softmax,
+                scale_output,
+                is_causal,
+            )
 
         # convert o back to f32 for comparison
         o_fp32, o_fp32_torch = cutlass_torch.cute_tensor_like(
@@ -247,24 +333,43 @@ def run(
     # summary. Pure no-op when iterations <= 0 (return None).
     # ------------------------------------------------------------------
     if iterations > 0:
-        kernel_args = cute_testing.JitArguments(
-            q_tensor.iterator,
-            k_tensor.iterator,
-            v_tensor.iterator,
-            o_tensor.iterator,
-            scale_k_tensor.iterator,
-            scale_v_tensor.iterator,
-            problem_size,
-            scale_softmax_log2,
-            scale_output,
-            window_size_left if window_size_left is None else Int32(window_size_left),
-            (
-                window_size_right
-                if window_size_right is None
-                else Int32(window_size_right)
-            ),
-            current_stream,
-        )
+        if is_mixed_input:
+            kernel_args = cute_testing.JitArguments(
+                q_tensor.iterator,
+                k_tensor.iterator,
+                v_tensor.iterator,
+                o_tensor.iterator,
+                scale_k_tensor.iterator,
+                scale_v_tensor.iterator,
+                problem_size,
+                scale_softmax_log2,
+                scale_output,
+                window_size_left if window_size_left is None else Int32(window_size_left),
+                (
+                    window_size_right
+                    if window_size_right is None
+                    else Int32(window_size_right)
+                ),
+                current_stream,
+            )
+        else:
+            kernel_args = cute_testing.JitArguments(
+                q_tensor.iterator,
+                k_tensor.iterator,
+                v_tensor.iterator,
+                o_tensor.iterator,
+                problem_size,
+                scale_softmax_log2,
+                scale_output,
+                window_size_left if window_size_left is None else Int32(window_size_left),
+                (
+                    window_size_right
+                    if window_size_right is None
+                    else Int32(window_size_right)
+                ),
+                current_stream,
+                None,
+            )
         avg_time_us = cute_testing.benchmark(
             compiled_fmha,
             kernel_arguments=kernel_args,
@@ -291,3 +396,185 @@ def run(
         )
         return avg_time_us
     return None
+
+
+def run_llm_multi_round_prefill_test_d256(
+    batch_size: int = 4,
+    seq_len: int = 8,
+    num_rounds: int = 3,
+    h_q: int = 8,
+    h_k: int = 8,
+    d: int = 256,
+    kv_cache_capacity: int = 64,
+    is_persistent: bool = True,
+    is_causal: bool = True,
+    bottom_right_align: bool = True,
+    tolerance: float = 0.1,
+    q_dtype= cutlass.BFloat16,
+):
+    """Multi-round LLM prefill test for d=256 homogeneous FMHA (BSHD + packed KV)."""
+    _tag = "[llm_prefill_d256]"
+    b = batch_size
+    cap = kv_cache_capacity
+    h_r = h_q // h_k
+    window_size_left = None
+    window_size_right = 0 if is_causal else None
+
+    print(f"{_tag} Running multi-round prefill accuracy test:")
+    print(
+        f"{_tag}   b={b}, seq_len={seq_len}, rounds={num_rounds}, "
+        f"cap={cap}, h_q={h_q}, h_k={h_k}, d={d}, is_causal={is_causal}"
+    )
+
+    if d != 256:
+        raise ValueError("d must be 256 for fmha_d256 LLM test")
+    if h_q % h_k != 0:
+        raise ValueError("h_q must be divisible by h_k")
+    if num_rounds * seq_len > cap:
+        raise ValueError(
+            f"total tokens ({num_rounds * seq_len}) exceeds capacity ({cap})"
+        )
+
+    cp.random.seed(42)
+    np.random.seed(42)
+
+    _scale_q = 1.0
+    _scale_k = 1.0
+    _scale_v = 1.0
+    _inv_scale_o = 1.0
+    ref_scale_softmax = 1.0 / math.sqrt(d)
+
+    mask_type = fmha_utils.MaskEnum.WINDOW_MASK
+    if bottom_right_align:
+        mask_type = fmha_utils.MaskEnum.WINDOW_MASK_INFERENCE
+
+    fmha_op = MixedInputFusedMultiHeadAttentionPrefillD256(
+        scale_granularity=256,
+        qk_acc_dtype=Float32,
+        pv_acc_dtype=Float32,
+        is_persistent=is_persistent,
+        mask_type=mask_type,
+        is_mixed_input=False,
+    )
+    import cutlass.torch as cutlass_torch
+
+    current_stream = cutlass_torch.default_stream()
+    _wsl = Int32(0)
+
+    def _to_cute(arr, element_type):
+        t = from_dlpack(arr, assumed_align=16)
+        t.element_type = element_type
+        return t
+
+    cp_dtype = cp.float16 if q_dtype == cutlass.Float16 else cp.float16
+    if q_dtype == cutlass.BFloat16:
+        cp_dtype = cp.float16  # cupy has no bf16; use fp16 storage for test data
+
+    kv_np = np.zeros((b, 2, h_k, cap, d), dtype=np.float32)
+    compiled_fmha = None
+    all_pass = True
+    current_pos = 0
+
+    for round_idx in range(num_rounds):
+        effective_kv_len = current_pos + seq_len
+        print(
+            f"\n--- Round {round_idx + 1}/{num_rounds} "
+            f"(pos={current_pos}, s_k={effective_kv_len}, cap={cap}) ---"
+        )
+
+        q_np = np.random.randint(-2, 2, (b, seq_len, h_q, d)).astype(np.float32)
+        new_k_np = np.random.randint(-2, 2, (b, h_k, seq_len, d)).astype(np.float32)
+        new_v_np = np.random.randint(-2, 2, (b, h_k, seq_len, d)).astype(np.float32)
+
+        kv_np[:, 0, :, current_pos:current_pos + seq_len, :] = new_k_np
+        kv_np[:, 1, :, current_pos:current_pos + seq_len, :] = new_v_np
+
+        q_cp = cp.asarray(q_np.astype(cp_dtype))
+        kv_cp = cp.asarray(kv_np.astype(cp_dtype))
+        o_cp = cp.zeros((b, seq_len, h_q, d), dtype=cp_dtype)
+
+        q_t = mark_bshd_dynamic(_to_cute(q_cp, q_dtype))
+        kv_t = mark_kv_cache_dynamic(_to_cute(kv_cp, q_dtype))
+        o_t = mark_bshd_dynamic(_to_cute(o_cp, q_dtype))
+
+        cu_kv_np = np.arange(b + 1, dtype=np.int32) * effective_kv_len
+        cu_kv_cp = cp.asarray(cu_kv_np)
+        cu_kv = mark_1d_dynamic(from_dlpack(cu_kv_cp, assumed_align=16))
+
+        if compiled_fmha is None:
+            start_time = time.time()
+            compiled_fmha = cute.compile(
+                fmha_op.call_llm,
+                q_t,
+                kv_t,
+                o_t,
+                cu_kv,
+                _wsl,
+                _scale_q,
+                _scale_k,
+                _scale_v,
+                _inv_scale_o,
+                current_stream,
+                options="--opt-level 2",
+            )
+            print(f"{_tag} Compilation time: {time.time() - start_time:.4f}s")
+
+        compiled_fmha(
+            q_t,
+            kv_t,
+            o_t,
+            cu_kv,
+            _wsl,
+            _scale_q,
+            _scale_k,
+            _scale_v,
+            _inv_scale_o,
+            current_stream,
+        )
+
+        o_f32_cp = cp.empty(o_cp.shape, dtype=cp.float32)
+        o_f32_cute = from_dlpack(o_f32_cp, assumed_align=16)
+        o_f32_cute.element_type = Float32
+        o_f32_cute = o_f32_cute.mark_layout_dynamic(leading_dim=3)
+        cute.testing.convert(o_t, o_f32_cute)
+        o_result = o_f32_cp.get()
+
+        for bi in range(b):
+            q_b = q_np[bi].transpose(1, 0, 2)
+            k_b = kv_np[bi, 0, :, :effective_kv_len]
+            v_b = kv_np[bi, 1, :, :effective_kv_len]
+            if h_q != h_k:
+                k_b = np.repeat(k_b, h_r, axis=0)
+                v_b = np.repeat(v_b, h_r, axis=0)
+            scores = np.einsum("hqd,hkd->hqk", q_b, k_b) * ref_scale_softmax
+            s_k_len = effective_kv_len
+            if is_causal:
+                q_coords = np.arange(seq_len).reshape(-1, 1)
+                k_coords = np.arange(s_k_len).reshape(1, -1)
+                offset = (s_k_len - seq_len) if bottom_right_align else 0
+                mask = k_coords > q_coords + offset
+                scores = np.where(mask, -np.inf, scores)
+            probs = _numpy_softmax(scores, axis=-1)
+            o_ref = np.einsum("hqk,hkd->hqd", probs, v_b)
+            o_ref = o_ref.transpose(1, 0, 2)
+            o_actual = o_result[bi]
+            max_diff = np.max(np.abs(o_actual - o_ref))
+            mean_diff = np.mean(np.abs(o_actual - o_ref))
+            if max_diff > tolerance:
+                print(
+                    f"  batch {bi}: FAIL  max_diff={max_diff:.6f}  "
+                    f"mean_diff={mean_diff:.6f}"
+                )
+                all_pass = False
+            else:
+                print(
+                    f"  batch {bi}: PASS  max_diff={max_diff:.6f}  "
+                    f"mean_diff={mean_diff:.6f}"
+                )
+        current_pos += seq_len
+
+    if all_pass:
+        print(f"\n{_tag} All {num_rounds} rounds passed.")
+    else:
+        raise AssertionError(f"{_tag} Some rounds failed accuracy check!")
+    return all_pass

@@ -27,6 +27,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 """Host-side configuration for CUTLASS d=256 mixed-input FMHA prefill."""
 
+import math
 from typing import Tuple, Type
 
 import cutlass
@@ -43,7 +44,12 @@ class MixedInputFusedMultiHeadAttentionPrefillD256:
         pv_acc_dtype: Type[cutlass.Numeric],
         is_persistent: bool,
         mask_type: fmha_utils.MaskEnum,
+        is_mixed_input: bool = True,
     ):
+        self.is_mixed_input = is_mixed_input
+        self.head_dim = 256
+        self.inv_sqrt_head_dim = 1.0 / math.sqrt(self.head_dim)
+        self.log2_e = math.log2(math.exp(1.0))
         self.qk_acc_dtype = qk_acc_dtype
         self.pv_acc_dtype = pv_acc_dtype
         self.cta_tiler = (128, 128, 256)

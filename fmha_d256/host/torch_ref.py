@@ -34,6 +34,36 @@ def create_tensor(shape, dtype):
     return f32_torch_tensor, cute_tensor, torch_tensor
 
 
+def run_torch_fmha_homo(
+    q, k, v, scale_softmax=1.0, scale_output=1.0, is_causal=False
+):
+    """Reference FMHA with homogeneous Q/K/V dtype (no quantization)."""
+    h_q = q.shape[1]
+    h_k = k.shape[1]
+    if not h_q == h_k:
+        repeat_factor = h_q // h_k
+        k = k.repeat_interleave(repeat_factor, dim=1)
+        v = v.repeat_interleave(repeat_factor, dim=1)
+    batch = q.shape[0]
+    ref_list = []
+    for batch_idx in range(batch):
+        q_i = q[batch_idx]
+        k_i = k[batch_idx]
+        v_i = v[batch_idx]
+        s_i = torch.einsum("hqd,hkd->hqk", q_i, k_i) * scale_softmax
+        s_q_len = q_i.shape[1]
+        s_k_len = k_i.shape[1]
+        if is_causal:
+            q_coords = torch.arange(0, s_q_len).view(-1, 1)
+            k_coords = torch.arange(0, s_k_len).view(1, -1)
+            _mask = k_coords > q_coords + s_k_len - s_q_len
+            s_i = s_i.masked_fill(_mask, -torch.inf)
+        p_i = s_i.softmax(dim=-1)
+        ref_i = torch.einsum("hqk,hkd->hqd", p_i, v_i) * scale_output
+        ref_list.append(ref_i)
+    return torch.stack(ref_list)
+
+
 def run_torch_fmha(
     q, k, v, scale_k, scale_v, scale_softmax=1.0, scale_output=1.0, is_causal=False
 ):

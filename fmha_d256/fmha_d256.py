@@ -117,7 +117,19 @@ import torch
 import cutlass
 from cutlass.cute.typing import Float32
 
-from fmha_d256 import run
+from fmha_d256.runner import run, run_llm_multi_round_prefill_test_d256
+
+
+def _parse_dtype(s: str):
+    aliases = {
+        "bf16": "BFloat16",
+        "bfloat16": "BFloat16",
+        "fp16": "Float16",
+        "float16": "Float16",
+        "i8": "Int8",
+        "int8": "Int8",
+    }
+    return cutlass.dtype(aliases.get(s.lower(), s))
 
 
 def _parse_comma_separated_ints(s: str):
@@ -132,8 +144,9 @@ def _parse_comma_separated_ints(s: str):
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run the CUTLASS official Blackwell d=256 mixed-input FMHA prefill "
-            "kernel (BF16 Q / INT8 K,V + scale / BF16 O)."
+            "Run the CUTLASS Blackwell d=256 FMHA prefill kernel. "
+            "Supports mixed-input (BF16 Q / INT8 K,V + scale) and "
+            "homogeneous dtype (BF16/FP16 Q/K/V)."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -152,20 +165,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Dtypes (defaults match upstream)
     parser.add_argument(
-        "--q_dtype", type=cutlass.dtype, default=cutlass.BFloat16,
-        help="Q dtype (BFloat16 supported).",
+        "--q_dtype", type=_parse_dtype, default=cutlass.BFloat16,
+        help="Q dtype (BFloat16 or Float16).",
     )
     parser.add_argument(
-        "--kv_dtype", type=cutlass.dtype, default=cutlass.Int8,
-        help="KV dtype (Int8 supported).",
+        "--kv_dtype", type=_parse_dtype, default=cutlass.Int8,
+        help="KV dtype: Int8 (mixed) or BFloat16/Float16 (homogeneous).",
     )
     parser.add_argument(
-        "--o_dtype", type=cutlass.dtype, default=cutlass.BFloat16,
+        "--o_dtype", type=_parse_dtype, default=cutlass.BFloat16,
         help="O dtype (BFloat16 supported).",
     )
     parser.add_argument(
-        "--scale_dtype", type=cutlass.dtype, default=cutlass.BFloat16,
-        help="Scale dtype (BFloat16 supported).",
+        "--scale_dtype", type=_parse_dtype, default=cutlass.BFloat16,
+        help="Scale dtype (mixed-input only).",
     )
     parser.add_argument(
         "--scale_granularity", type=int, default=256, choices=(128, 256),
@@ -222,6 +235,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--no_benchmark", action="store_true",
         help="Disable benchmarking entirely (equivalent to --iterations 0).",
     )
+    parser.add_argument(
+        "--llm_multi_round", action="store_true",
+        help="Run multi-round LLM prefill test (BSHD + packed KV cache, homo dtype).",
+    )
+    parser.add_argument(
+        "--llm_batch", type=int, default=4,
+        help="Batch size for --llm_multi_round.",
+    )
+    parser.add_argument(
+        "--llm_seq_len", type=int, default=128,
+        help="Tokens appended per round for --llm_multi_round.",
+    )
+    parser.add_argument(
+        "--llm_rounds", type=int, default=3,
+        help="Number of prefill rounds for --llm_multi_round.",
+    )
+    parser.add_argument(
+        "--llm_kv_cap", type=int, default=512,
+        help="Physical KV cache capacity for --llm_multi_round.",
+    )
 
     return parser
 
@@ -237,6 +270,23 @@ def main(argv=None) -> int:
 
     if not torch.cuda.is_available():
         raise RuntimeError("GPU is required to run this example!")
+
+    if args.llm_multi_round:
+        run_llm_multi_round_prefill_test_d256(
+            batch_size=args.llm_batch,
+            seq_len=args.llm_seq_len,
+            num_rounds=args.llm_rounds,
+            h_q=args.q_shape[1],
+            h_k=args.k_shape[1],
+            d=args.q_shape[3],
+            kv_cache_capacity=args.llm_kv_cap,
+            is_persistent=args.is_persistent,
+            is_causal=args.is_causal,
+            tolerance=args.tolerance,
+            q_dtype=args.q_dtype,
+        )
+        print("PASS")
+        return 0
 
     iterations = 0 if args.no_benchmark else args.iterations
 
@@ -273,11 +323,14 @@ def main(argv=None) -> int:
         if args.is_causal:
             flops *= 0.5
         tflops = flops / (latency_us * 1e-6) / 1e12
-        # Approximate IO bytes: BF16 Q + Int8 K/V + BF16 O + BF16 scales.
+        # Approximate IO bytes (mixed-input includes INT8 KV + scales).
         bytes_q = b * h_q * s_q * d * 2
-        bytes_kv = 2 * b * h_k * s_k * d * 1
+        kv_bytes_per = 1 if args.kv_dtype == cutlass.Int8 else 2
+        bytes_kv = 2 * b * h_k * s_k * d * kv_bytes_per
         bytes_o = b * h_q * s_q * d * 2
-        bytes_scale = 2 * b * h_k * s_k * (d // args.scale_granularity) * 2
+        bytes_scale = 0
+        if args.kv_dtype == cutlass.Int8:
+            bytes_scale = 2 * b * h_k * s_k * (d // args.scale_granularity) * 2
         gb = (bytes_q + bytes_kv + bytes_o + bytes_scale) / 1e9
         bw = gb / (latency_us * 1e-6)
         print(

@@ -9,7 +9,10 @@ Package layout mirrors ``fmha/``:
 
 from fmha_d256.host.config import MixedInputFusedMultiHeadAttentionPrefillD256
 from fmha_d256.host.launcher import launch as _launch
+from fmha_d256.host.launcher import launch_homo as _launch_homo
+from fmha_d256.host.launcher import _call_llm as _call_llm
 from fmha_d256.device.kernel import kernel as _device_kernel
+from fmha_d256.device.kernel import kernel_homo as _device_kernel_homo
 from fmha_d256.device.warp_load import load_warp_body as _load_warp_body
 from fmha_d256.device.warp_mma import (
     mma_warp_body as _mma_warp_body,
@@ -31,7 +34,10 @@ from fmha_d256.runner import run
 # Bind @cute.jit / @cute.kernel callables as methods so the DSL treats ``self``
 # as a static Python receiver (same pattern as fmha/__init__.py).
 MixedInputFusedMultiHeadAttentionPrefillD256.__call__ = _launch
+MixedInputFusedMultiHeadAttentionPrefillD256.launch_homo = _launch_homo
+MixedInputFusedMultiHeadAttentionPrefillD256.call_llm = _call_llm
 MixedInputFusedMultiHeadAttentionPrefillD256.kernel = _device_kernel
+MixedInputFusedMultiHeadAttentionPrefillD256.kernel_homo = _device_kernel_homo
 MixedInputFusedMultiHeadAttentionPrefillD256.load_warp_body = _load_warp_body
 MixedInputFusedMultiHeadAttentionPrefillD256.mma_warp_body = _mma_warp_body
 MixedInputFusedMultiHeadAttentionPrefillD256.mma_pv = _mma_pv
@@ -43,4 +49,8 @@ MixedInputFusedMultiHeadAttentionPrefillD256.correction_rescale = _correction_re
 MixedInputFusedMultiHeadAttentionPrefillD256.correction_epilog = _correction_epilog
 MixedInputFusedMultiHeadAttentionPrefillD256.transform_warp_body = _transform_warp_body
 
-__all__ = ["MixedInputFusedMultiHeadAttentionPrefillD256", "run"]
+__all__ = [
+    "MixedInputFusedMultiHeadAttentionPrefillD256",
+    "run",
+    "run_llm_multi_round_prefill_test_d256",
+]

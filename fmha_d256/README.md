@@ -216,25 +216,49 @@ AttributeError: '_Pointer' object has no attribute 'ptr'
 | 项目 | `fmha/` (现有) | `fmha_d256/` (本目录) |
 | --- | --- | --- |
 | 来源 | 自行重构 + outer-loop D-chunk 设计 | CUTLASS 官方原样迁移 |
-| KV dtype | FP16/BF16 (un-quantized) | **INT8 + scale** |
+| KV dtype | FP16/BF16 (un-quantized) | INT8 + scale **或** BF16/FP16 同质路径 |
 | D 支持 | D≤128 完美; D=256 Round 2 死锁 (见 fmha/STATUS.md) | D=256 原生支持 |
 | Cluster | 1-CTA | **2-CTA** |
-| LLM prefill 接口 | ✓ 已接入 (cumulative seqlen + packed cache) | ✗ 需后续适配 |
+| LLM prefill 接口 | ✓ 已接入 (cumulative seqlen + packed cache) | ✓ 同质 dtype + `call_llm` |
 | 代码量 | ~3500 行 (10+ 模块) | ~2400 行 (3 个官方文件 + 1 个 shim) |
 | 推荐用途 | 学习 D≤128 的 outer-loop / pipeline 设计 | 跑 D=256 production 路径 |
 
+## 同质 dtype（不量化）与 LLM prefill
+
+`fmha_d256` 现支持两条编译路径：
+
+| 路径 | KV dtype | 入口 | 用途 |
+|------|----------|------|------|
+| mixed-input（默认） | INT8 + BF16 scale | `__call__` / `launch` | CUTLASS 官方量化路径 |
+| homogeneous | BF16/FP16（与 Q 相同） | `launch_homo` | LLM runner、精度对比 |
+
+**单轮精度验证（同质 BF16）：**
+
+```bash
+cd <study_cute root>
+unset CUTE_DSL_ARCH
+python3 fmha_d256/fmha_d256.py \
+    --q_shape 1,8,1024,256 --k_shape 1,8,1024,256 \
+    --kv_dtype bf16 --is_persistent --is_causal
+```
+
+**多轮 LLM prefill（BSHD + packed KV cache + cum_seqlen_k）：**
+
+```bash
+python3 fmha_d256/fmha_d256.py \
+    --llm_multi_round --llm_batch 4 --llm_seq_len 128 \
+    --llm_rounds 3 --llm_kv_cap 512 \
+    --q_shape 1,8,128,256 --k_shape 1,8,128,256 \
+    --kv_dtype bf16 --is_persistent --is_causal --iterations 0
+```
+
+实现要点：
+- `kernel_homo`：独立 sV SMEM、无 scale pipeline
+- `transform_k/v`：保留 layout 变换，跳过 dequant
+- `_call_llm`：BSHD `(B,S,H,D)` + KV cache `(B,2,H,cap,D)`，与 `fmha/` 契约一致
+
 ## 后续工作 (可选)
 
-1. **剥离 mixed-input 量化** — 把 i8 dequant 路径改成 noop, 直接接受
-   FP16/BF16 K/V。这样可以跟现有 `fmha/` 模块统一接口。涉及:
-   - 删 `transform_warp_ids` 那 8 个 warp + 相关 pipeline
-   - 把 `dequant_kv_consumer` 改成直接接 `load_kv_consumer`
-   - 把 `kv_dtype` 改成跟 `q_dtype` 一致
-   - 删 `scale_k` / `scale_v` 参数
-   - 大概 30-40% 代码改动
-2. **接 study_cute LLM prefill runner** — 让 `run_llm_multi_round_prefill_test`
-   能用本 kernel 跑多轮 prefill。涉及:
-   - 适配 cumulative seqlen 输入 (本 kernel 当前用 fixed-size shape)
-   - cache K/V 用 INT8 存储 + scale (或者先做 1. 再做这步)
-3. **性能对比** — 跟现有 `fmha/` D=128 path 在 Thor 上的 latency 对比, 验证
-   2-CTA cluster + iterations 设计的实际收益
+1. **FP16 端到端** — LLM test 目前用 fp16 存储近似 bf16；完善 cupy bf16 路径
+2. **性能对比** — homo vs mixed-input vs `fmha/` D=128 在 Thor 上的 latency
+3. **Variable seqlen Q** — 当前 LLM 路径仅 `cum_seqlen_k`，Q 长度来自 tensor shape

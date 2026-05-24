@@ -36,7 +36,7 @@ import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass.cute.typing import Int32, Float32
+from cutlass.cute.typing import Int32, Int64, Float32
 
 from fmha_d256 import fmha_helpers as fmha_utils
 from fmha_d256 import prefill_helpers as prefill_utils

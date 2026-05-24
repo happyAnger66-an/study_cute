@@ -117,7 +117,7 @@ import torch
 import cutlass
 from cutlass.cute.typing import Float32
 
-from fmha_d256.mixed_input_fmha_prefill_d256 import run
+from fmha_d256 import run
 
 
 def _parse_comma_separated_ints(s: str):

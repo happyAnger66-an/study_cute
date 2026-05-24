@@ -1,7 +1,34 @@
 # fmha_d256 — CUTLASS 官方 d=256 FMHA prefill 迁移
 
-把 CUTLASS 官方 Blackwell d=256 mixed-input FMHA prefill kernel 原样迁移到
-study_cute 仓库下,方便在 Jetson Thor (sm_100a) 上跑 head_dim=256 的 FMHA。
+把 CUTLASS 官方 Blackwell d=256 mixed-input FMHA prefill kernel 迁移到
+study_cute 仓库下,方便在 Jetson Thor (sm_110a) 上跑 head_dim=256 的 FMHA。
+
+## 包结构 (对齐 `fmha/`)
+
+```
+fmha_d256/
+├── __init__.py              # 绑定 device 方法到 config 类 + 导出 run
+├── mixed_input_fmha_prefill_d256.py  # 薄 shim (向后兼容 import)
+├── runner.py                # run() 测试驱动 / benchmark
+├── fmha_d256.py             # CLI 入口
+├── bench_sweep.sh           # 批量 benchmark
+├── fmha_helpers.py          # CUTLASS helpers (官方)
+├── prefill_helpers.py       # load/mma/dequant 流水线 helpers (官方)
+├── host/
+│   ├── config.py            # MixedInputFusedMultiHeadAttentionPrefillD256 配置
+│   ├── launcher.py          # @cute.jit launch (TMA/MMA/SMEM 构建 + kernel 发射)
+│   └── torch_ref.py         # create_tensor + torch reference
+└── device/
+    ├── kernel.py            # @cute.kernel 壳 + pipeline/SMEM 分配 + warp 分发
+    ├── warp_load.py         # TMA load warp
+    ├── warp_transform.py    # INT8→BF16 dequant warp
+    ├── warp_mma.py          # MMA warp + mma_pv
+    ├── warp_softmax.py      # softmax warp + softmax_step + store_sum
+    └── warp_correction.py   # correction warp + rescale/epilog
+```
+
+原先单文件 `mixed_input_fmha_prefill_d256.py` (~2100 行) 已拆成上述模块; 逻辑不变,
+仅做结构重组 (与 `fmha/host` + `fmha/device` 相同模式)。
 
 ## 文件来源 (CUTLASS 官方源)
 
@@ -9,7 +36,7 @@ study_cute 仓库下,方便在 Jetson Thor (sm_100a) 上跑 head_dim=256 的 FMH
 | --- | --- |
 | `fmha_helpers.py` | `examples/python/CuTeDSL/helpers/fmha_helpers.py` |
 | `prefill_helpers.py` | `examples/python/CuTeDSL/cute/blackwell/kernel/attention/mixed_input_fmha/prefill_helpers.py` |
-| `mixed_input_fmha_prefill_d256.py` | `examples/python/CuTeDSL/cute/blackwell/kernel/attention/mixed_input_fmha/mixed_input_fmha_prefill_d256.py` |
+| `mixed_input_fmha_prefill_d256.py` | 薄 shim → `from fmha_d256 import ...` |
 | `fmha_d256.py` | study_cute 自写的轻量 CLI shim |
 | `__init__.py` | study_cute 自写,空 (使 `fmha_d256` 变成 Python package) |
 
@@ -19,9 +46,10 @@ study_cute 仓库下,方便在 Jetson Thor (sm_100a) 上跑 head_dim=256 的 FMH
 | --- | --- | --- |
 | Import rewrites (`from helpers import ...` → `from fmha_d256 import ...`) | 48-62 | Repo layout 适配 |
 | 去掉 `storage.tmem_holding_buf.ptr` / `storage.tmem_dealloc_mbar.ptr` 的 `.ptr` | 666 / 670 | Thor 上 DSL (`nvidia-cutlass-dsl` <= 4.4.2) 中 `storage.<scalar_field>` 已经直接返回 `_Pointer`, 没有 `.ptr` 属性 (新 DSL 才加上的 wrapper) |
-| 在 `run()` 末尾追加 `cute.testing.benchmark` block + 让 `run()` 返回 latency (us) | 1855-1905 | upstream 的 `warmup_iterations` / `iterations` 参数*没有被消费*; 这里补上真正的 timing 逻辑 (warm-up + 多次 launch + cuda event) + 算 TFLOPS |
+| 在 `run()` 末尾追加 benchmark block | `runner.py` | study_cute 增补 |
+| 包结构拆分为 `host/` + `device/` | 全目录 | study_cute 重构 (对齐 `fmha/`) |
 
-除上述 3 处外,与官方一致,便于后续 follow upstream。
+除上述 patch 外,核心 kernel 逻辑与官方一致。
 
 ## 接口契约
 

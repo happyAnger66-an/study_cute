@@ -33,7 +33,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
-from cutlass.pipeline import pipeline_init_wait
+from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.cute.typing import Float32, Int32
 
 from fmha_d256 import fmha_helpers as fmha_utils

@@ -440,7 +440,7 @@ def kernel(
         if warp_idx < self.mma_warp_id and warp_idx >= self.correction_warp_ids[0]:
             self.correction_warp_body(
                 qk_tiled_mma, qk_thr_mma, tmem, tStS, tOtO_staged, sSum,
-                gO_qdl, cO_qdl, scale_softmax_log2, scale_output, seqlen_q,
+                gO_qdl, cO_qdl, scale_softmax_log2, scale_output, seqlen_q, seqlen_k,
                 window_size_left, window_size_right, epi_tile,
                 s_corr_consumer, mma_o_consumer, sum_consumer,
                 tile_sched_params,
@@ -774,7 +774,7 @@ def kernel_homo(
         if warp_idx < self.mma_warp_id and warp_idx >= self.correction_warp_ids[0]:
             self.correction_warp_body(
                 qk_tiled_mma, qk_thr_mma, tmem, tStS, tOtO_staged, sSum,
-                gO_qdl, cO_qdl, scale_softmax_log2, scale_output, seqlen_q,
+                gO_qdl, cO_qdl, scale_softmax_log2, scale_output, seqlen_q, seqlen_k,
                 window_size_left, window_size_right, epi_tile,
                 s_corr_consumer, mma_o_consumer, sum_consumer,
                 tile_sched_params,

@@ -17,6 +17,9 @@
 		},
 		{
 			"path": "../TensorRT-LLM"
+		},
+		{
+			"path": "../model_optimizer"
 		}
 	],
 	"settings": {}

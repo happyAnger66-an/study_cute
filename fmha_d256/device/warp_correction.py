@@ -41,7 +41,7 @@ from fmha_d256 import prefill_helpers as prefill_utils
 @cute.jit
 def correction_warp_body(self,
     qk_tiled_mma, qk_thr_mma, tmem, tStS, tOtO_staged, sSum,
-    gO_qdl, cO_qdl, scale_softmax_log2, scale_output, seqlen_q,
+    gO_qdl, cO_qdl, scale_softmax_log2, scale_output, seqlen_q, seqlen_k,
     window_size_left, window_size_right, epi_tile,
     s_corr_consumer, mma_o_consumer, sum_consumer,
     tile_sched_params,

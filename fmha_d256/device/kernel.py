@@ -406,7 +406,7 @@ def kernel(
         if warp_idx == self.load_warp_id:
             self.load_warp_body(
                 qk_tiled_mma, pv_tiled_mma,
-                tQgQ_qdl, tKgK_kdl, tKgScaleK_kdl, tVgV_ddl, tVgScaleV_dkl,
+                tQgQ_qdl, tKgK_kdl, tKgScaleK_kdl, tVgV_dkl, tVgScaleV_dkl,
                 tQsQ, tKsK, tKsScaleK, tVsV, tVsScaleV,
                 tma_atom_q, tma_atom_k, tma_atom_v, tma_atom_scale_k, tma_atom_scale_v,
                 load_q_producer, load_kv_producer, load_scale_k_producer, load_scale_v_producer,
